@@ -2,7 +2,7 @@
 
  * Building process:  
    * Dependency:  
-    [OpenSSL with RATS features](https://code.siemens.com/ct-rda-cst-ses-de/remote-attestation/base-functionality/openssl.git)  
+    [OpenSSL with RATS features](https://github.com/Guiliano99/openssl/tree/demo/docker_RATS2)
 
    * Build command:  
        ```USE_ATGLIB=1 make -f Makefile_v1```  
