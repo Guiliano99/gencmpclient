@@ -512,6 +512,65 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
 }
 #endif
 
+/*
+ * Local ASN.1 types for AttestationBundle (draft-ietf-lamps-csr-attestation-22).
+ *
+ * These are temporary stand-ins until OSSL_CSR_ATTESTATION_STATEMENT and
+ * OSSL_CSR_ATTESTATION_BUNDLE are added to crypto/crmf/crmf_asn.c in the
+ * Guiliano99/openssl fork (see draft-ietf-lamps-csr-attestation-22-changes.md §4.2).
+ * Once the fork provides those types, replace LOCAL_ATT_STMT / LOCAL_ATT_BUNDLE
+ * and their IMPLEMENT_ASN1_FUNCTIONS blocks with the upstream definitions.
+ *
+ * Encoded structure:
+ *
+ *   AttestationStatement ::= SEQUENCE {
+ *       type           OID,
+ *       -- bindsPublicKey [0] BOOLEAN DEFAULT TRUE -- omitted (takes default)
+ *       stmt           OCTET STRING  -- TODO: ANY once format OID is known
+ *   }
+ *   AttestationBundle ::= SEQUENCE {
+ *       attestations  SEQUENCE OF AttestationStatement,
+ *       -- certs OPTIONAL -- omitted in this POC
+ *   }
+ */
+typedef struct local_att_stmt_st {
+    ASN1_OBJECT *type;
+    ASN1_OCTET_STRING *stmt;
+} LOCAL_ATT_STMT;
+
+ASN1_SEQUENCE(LOCAL_ATT_STMT) = {
+    ASN1_SIMPLE(LOCAL_ATT_STMT, type, ASN1_OBJECT),
+    ASN1_SIMPLE(LOCAL_ATT_STMT, stmt, ASN1_OCTET_STRING),
+} ASN1_SEQUENCE_END(LOCAL_ATT_STMT)
+IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_STMT)
+
+DEFINE_STACK_OF(LOCAL_ATT_STMT)
+
+typedef struct local_att_bundle_st {
+    STACK_OF(LOCAL_ATT_STMT) *attestations;
+} LOCAL_ATT_BUNDLE;
+
+ASN1_SEQUENCE(LOCAL_ATT_BUNDLE) = {
+    ASN1_SEQUENCE_OF(LOCAL_ATT_BUNDLE, attestations, LOCAL_ATT_STMT),
+} ASN1_SEQUENCE_END(LOCAL_ATT_BUNDLE)
+IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
+
+/*
+ * Extension OID: id-aa-attestation (1.2.840.113549.1.9.16.2.59, arc .59).
+ * Fall back to the arc-.999 placeholder until the Guiliano99/openssl fork
+ * updates crypto/objects/objects.txt (see §5.2 of the maintenance guide).
+ */
+#ifndef NID_id_aa_attestation
+# define NID_id_aa_attestation NID_id_smime_aa_evidenceStatement
+#endif
+
+/*
+ * Placeholder OID for AttestationStatement.type.
+ * The draft leaves format-specific OIDs to separate RFCs (e.g.,
+ * draft-ietf-rats-eat for EAT).  Replace once the ATG token format OID is
+ * allocated.
+ * TODO: replace with the real vendor/IANA OID for the ATG JSON-EAT format.
+ */
 #define EVIDENCE_LEN 2000
 #define NONCE_SZ 32
 static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config)
