@@ -590,7 +590,7 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx, RATS_REQ *rats_conf
     oct.length = der_len;
     oct.flags = 0;
 
-    ext = X509_EXTENSION_create_by_NID(NULL, NID_id_smime_aa_evidenceStatement,
+    ext = X509_EXTENSION_create_by_NID(NULL, NID_id_smime_aa_attestation,
                                        0, &oct);
     if (ext == NULL
         || (exts = sk_X509_EXTENSION_new_null()) == NULL
