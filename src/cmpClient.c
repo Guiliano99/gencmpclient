@@ -571,26 +571,29 @@ IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
  * allocated.
  * TODO: replace with the real vendor/IANA OID for the ATG JSON-EAT format.
  */
-#define EVIDENCE_LEN 2000
-#define NONCE_SZ 32
-static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config)
+#define ATG_STMT_TYPE_OID "1.3.6.1.4.1.99999.1"
+
+static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
+                                           RATS_REQ *rats_config)
 {
     X509_EXTENSIONS *exts = NULL;
     X509_EXTENSION *ext = NULL;
-    unsigned char *der_data = NULL, *evidence = NULL;
-    int der_len = 0, ret = 0, atg_ret;
-    int evidence_len = EVIDENCE_LEN;
-    ASN1_OCTET_STRING oct, *oct_nonce;
+    unsigned char *bundle_der = NULL;
+    int bundle_der_len = 0, ret = 0, atg_ret = -1;
+    ASN1_OCTET_STRING *oct_nonce;
+    ASN1_OCTET_STRING oct;
     struct token_req req;
     struct token_resp resp;
+    LOCAL_ATT_STMT *stmt = NULL;
+    LOCAL_ATT_BUNDLE *bundle = NULL;
 
     if (rats_config == NULL)
         goto err;
-    (void)ctx;
-    (void)evidence_len;
+
     req.token_name = (char *)rats_config->tokenname;
     req.config_path = (char *) rats_config->tokencfgpath;
     req.plugconf_path = (char *)rats_config->plugincfgpath;
+
     oct_nonce = OSSL_CMP_CTX_get0_rats_nonce(ctx);
     if (oct_nonce == NULL) {
         LOG_err("Error: No nonce available for remote attestation");
@@ -599,23 +602,9 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx, RATS_REQ *rats_conf
     req.nonce = oct_nonce->data;
     req.nonce_size = oct_nonce->length;
     req.user_data_size = 0;
+
     atg_ret = atg_generate_evidence(req, &resp);
-    if (atg_ret == 0) {
-        printf("Token size: %lu\n", resp.token.buf_size);
-#if 0
-        printf("Token: [ ");
-        for (size_t i = 0; i < resp.token.buf_size; i++)
-            printf("0x%x ", resp.token.buf[i] & 0xff);
-        printf("]\n");
-#endif
-        if (resp.num_submods > 0) {
-            printf("Error: submodules are not supported.");
-            goto err;
-        }
-        oct.data = resp.token.buf;
-        oct.length = (int)resp.token.buf_size;
-        oct.flags = 0;
-    } else {
+    if (atg_ret != 0) {
         printf("An error has occurred in generating attestation token, return code - %d\n", atg_ret);
         printf("Token request details:\n");
         printf("Token Name: %s\n", req.token_name);
@@ -628,29 +617,55 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx, RATS_REQ *rats_conf
         printf("\nUser Data Size: %zu\n\n", req.user_data_size);
         goto err;
     }
+    printf("Token size: %lu\n", resp.token.buf_size);
 
-#if TEST_DUMMY_EVIDENCE
-    /* TODO: get evidence from library */
-    (void)ctx;
-    evidence = OPENSSL_malloc(EVIDENCE_LEN);
-    if (evidence == NULL)
-        return NULL;
-    memset(evidence, 0xAA, EVIDENCE_LEN);
-    oct.data = evidence;
-    oct.length = evidence_len;
-    oct.flags = 0;
-#endif
+    if (resp.num_submods > 0) {
+        printf("Error: submodules are not supported.\n");
+        goto err;
+    }
 
-    der_len = i2d_ASN1_OCTET_STRING(&oct, &der_data);
-    if (der_len < 0)
+    /*
+     * Build AttestationStatement { type OID, stmt OCTET STRING(token) }.
+     * LOCAL_ATT_STMT_new() initialises both pointer fields via ASN1_item_new.
+     */
+    stmt = LOCAL_ATT_STMT_new();
+    if (stmt == NULL)
+        goto err;
+    /* Replace the default-initialised empty OID with the token-format OID. */
+    ASN1_OBJECT_free(stmt->type);
+    stmt->type = OBJ_txt2obj(ATG_STMT_TYPE_OID, 1 /* dotted-decimal form */);
+    if (stmt->type == NULL)
+        goto err;
+    if (!ASN1_OCTET_STRING_set(stmt->stmt,
+                               resp.token.buf, (int)resp.token.buf_size))
         goto err;
 
-    oct.data = der_data;
-    oct.length = der_len;
-    oct.flags = 0;
+    /*
+     * Build AttestationBundle { attestations = [ stmt ] }.
+     * LOCAL_ATT_BUNDLE_new() may leave attestations as NULL; allocate if so.
+     */
+    bundle = LOCAL_ATT_BUNDLE_new();
+    if (bundle == NULL)
+        goto err;
+    if (bundle->attestations == NULL) {
+        bundle->attestations = sk_LOCAL_ATT_STMT_new_null();
+        if (bundle->attestations == NULL)
+            goto err;
+    }
+    if (!sk_LOCAL_ATT_STMT_push(bundle->attestations, stmt))
+        goto err;
+    stmt = NULL; /* ownership transferred to bundle */
 
-    ext = X509_EXTENSION_create_by_NID(NULL, NID_id_smime_aa_attestation,
-                                       0, &oct);
+    /* DER-encode the AttestationBundle; this becomes the extension extnValue. */
+    bundle_der_len = i2d_LOCAL_ATT_BUNDLE(bundle, &bundle_der);
+    if (bundle_der_len < 0)
+        goto err;
+
+    oct.data = bundle_der;
+    oct.length = bundle_der_len;
+    oct.flags = 0;
+    ext = X509_EXTENSION_create_by_NID(NULL, NID_id_aa_attestation,
+                                       0 /* not critical */, &oct);
     if (ext == NULL
         || (exts = sk_X509_EXTENSION_new_null()) == NULL
         || !sk_X509_EXTENSION_push(exts, ext))
@@ -658,8 +673,9 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx, RATS_REQ *rats_conf
     ret = 1;
 
  err:
-    OPENSSL_free(evidence);
-    OPENSSL_free(der_data);
+    LOCAL_ATT_STMT_free(stmt);   /* no-op when stmt was transferred to bundle */
+    LOCAL_ATT_BUNDLE_free(bundle);
+    OPENSSL_free(bundle_der);
     if (atg_ret == 0)
         atg_free_attestation_token(resp);
     if (ret == 0) {
