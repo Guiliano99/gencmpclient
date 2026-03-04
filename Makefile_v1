@@ -404,7 +404,7 @@ endif
 BUILD_ONLY_DIRS = OUT_DIR="$(OUT_DIR)" BIN_DIR="$(BIN_DIR)" \
     LIB_NAME="$(OUTLIB)" VERSION="$(VERSION)" LIBCMP_INC="$(LIBCMP_INC)" \
     OPENSSL_DIR="$(OPENSSL_DIR)" OPENSSL_LIB="$(OPENSSL_LIB)" \
-    LIBATG_INC="$(ATG_PREFIX)/include" LIBATG_LIB="$(ATG_PREFIX)/lib" \
+    $(if $(USE_ATGLIB),LIBATG_INC="$(ATG_PREFIX)/include" LIBATG_LIB="$(ATG_PREFIX)/lib",) \
     INSTALL_DEB_PKGS=$(INSTALL_DEB_PKGS) DEB_TARGET_ARCH=$(DEB_TARGET_ARCH)
 build_only: $(GENCMPCLIENT_CONFIG)
 	@ # cannot split line using '\' as Debian packaging cannot handle this
