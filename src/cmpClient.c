@@ -521,26 +521,36 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
  * Once the fork provides those types, replace LOCAL_ATT_STMT / LOCAL_ATT_BUNDLE
  * and their IMPLEMENT_ASN1_FUNCTIONS blocks with the upstream definitions.
  *
- * Encoded structure:
+ * Encoded structure (draft-ietf-lamps-csr-attestation-23 §4):
  *
  *   AttestationStatement ::= SEQUENCE {
- *       type           OID,
- *       -- bindsPublicKey [0] BOOLEAN DEFAULT TRUE -- omitted (takes default)
- *       stmt           OCTET STRING  -- TODO: ANY once format OID is known
+ *       type           ATTESTATION-STATEMENT.&id,        -- OID
+ *       bindsPublicKey [0] BOOLEAN DEFAULT TRUE,          -- omitted when default
+ *       stmt           ATTESTATION-STATEMENT.&Type,       -- ANY, typed by OID
+ *       attrs          [1] Attributes OPTIONAL            -- omitted
  *   }
  *   AttestationBundle ::= SEQUENCE {
- *       attestations  SEQUENCE OF AttestationStatement,
- *       -- certs OPTIONAL -- omitted in this POC
+ *       attestations  SEQUENCE SIZE (1..MAX) OF AttestationStatement,
+ *       certs         SEQUENCE SIZE (1..MAX) OF LimitedCertChoices OPTIONAL
  *   }
+ *
+ * bindsPublicKey: ASN1_BOOLEAN -1 = absent (takes DEFAULT TRUE), 0 = FALSE, 1 = TRUE.
+ * stmt: ASN1_TYPE (ANY) — currently wraps the ATG token as V_ASN1_OCTET_STRING
+ *       pending allocation of a real format OID (see ATG_STMT_TYPE_OID comment).
+ * certs: STACK_OF(X509) — OPTIONAL; NULL means omitted (no chain returned by ATG yet).
+ *        Only the `certificate` arm of LimitedCertChoices is supported for now.
  */
 typedef struct local_att_stmt_st {
-    ASN1_OBJECT *type;
-    ASN1_OCTET_STRING *stmt;
+    ASN1_OBJECT  *type;
+    ASN1_BOOLEAN  bindsPublicKey; /* [0] IMPLICIT DEFAULT TRUE; -1 = absent (default) */
+    ASN1_TYPE    *stmt;           /* ANY — typed by type OID */
+    /* attrs [1] OPTIONAL: omitted (AttestAttrSet is empty in draft-22) */
 } LOCAL_ATT_STMT;
 
 ASN1_SEQUENCE(LOCAL_ATT_STMT) = {
     ASN1_SIMPLE(LOCAL_ATT_STMT, type, ASN1_OBJECT),
-    ASN1_SIMPLE(LOCAL_ATT_STMT, stmt, ASN1_OCTET_STRING),
+    ASN1_IMP_OPT(LOCAL_ATT_STMT, bindsPublicKey, ASN1_BOOLEAN, 0),
+    ASN1_SIMPLE(LOCAL_ATT_STMT, stmt, ASN1_ANY),
 } ASN1_SEQUENCE_END(LOCAL_ATT_STMT)
 IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_STMT)
 
@@ -548,21 +558,25 @@ DEFINE_STACK_OF(LOCAL_ATT_STMT)
 
 typedef struct local_att_bundle_st {
     STACK_OF(LOCAL_ATT_STMT) *attestations;
+    STACK_OF(X509)           *certs;   /* LimitedCertChoices OPTIONAL */
 } LOCAL_ATT_BUNDLE;
 
 ASN1_SEQUENCE(LOCAL_ATT_BUNDLE) = {
     ASN1_SEQUENCE_OF(LOCAL_ATT_BUNDLE, attestations, LOCAL_ATT_STMT),
+    ASN1_SEQUENCE_OF_OPT(LOCAL_ATT_BUNDLE, certs, X509),
 } ASN1_SEQUENCE_END(LOCAL_ATT_BUNDLE)
 IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
 
 /*
- * Extension OID: id-aa-attestation (1.2.840.113549.1.9.16.2.59, arc .59).
- * Fall back to the arc-.999 placeholder until the Guiliano99/openssl fork
- * updates crypto/objects/objects.txt (see §5.2 of the maintenance guide).
+ * OID: id-aa-attestation = 1.2.840.113549.1.9.16.2.59
+ * Early-allocated per draft-ietf-lamps-csr-attestation-22 §2 (arc .59 of id-aa).
+ *
+ * We look up (and if necessary register) this OID at runtime in getattestationExt()
+ * via OBJ_txt2nid / OBJ_create, so the code works correctly regardless of whether
+ * the build-time OpenSSL headers already define NID_id_aa_attestation.  This also
+ * removes the previous dependency on the Guiliano99 fork's arc-.999 placeholder.
  */
-#ifndef NID_id_aa_attestation
-# define NID_id_aa_attestation NID_id_smime_aa_evidenceStatement
-#endif
+#define ID_AA_ATTESTATION_OID "1.2.840.113549.1.9.16.2.59"
 
 /*
  * Placeholder OID for AttestationStatement.type.
