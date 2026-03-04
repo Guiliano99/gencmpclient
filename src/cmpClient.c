@@ -514,58 +514,10 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
 
 /*
  * Local ASN.1 types for AttestationBundle (draft-ietf-lamps-csr-attestation-22).
- *
- * These are temporary stand-ins until OSSL_CSR_ATTESTATION_STATEMENT and
- * OSSL_CSR_ATTESTATION_BUNDLE are added to crypto/crmf/crmf_asn.c in the
- * Guiliano99/openssl fork (see draft-ietf-lamps-csr-attestation-22-changes.md §4.2).
- * Once the fork provides those types, replace LOCAL_ATT_STMT / LOCAL_ATT_BUNDLE
- * and their IMPLEMENT_ASN1_FUNCTIONS blocks with the upstream definitions.
- *
- * Encoded structure (draft-ietf-lamps-csr-attestation-23 §4):
- *
- *   AttestationStatement ::= SEQUENCE {
- *       type           ATTESTATION-STATEMENT.&id,        -- OID
- *       bindsPublicKey [0] BOOLEAN DEFAULT TRUE,          -- omitted when default
- *       stmt           ATTESTATION-STATEMENT.&Type,       -- ANY, typed by OID
- *       attrs          [1] Attributes OPTIONAL            -- omitted
- *   }
- *   AttestationBundle ::= SEQUENCE {
- *       attestations  SEQUENCE SIZE (1..MAX) OF AttestationStatement,
- *       certs         SEQUENCE SIZE (1..MAX) OF LimitedCertChoices OPTIONAL
- *   }
- *
- * bindsPublicKey: ASN1_BOOLEAN -1 = absent (takes DEFAULT TRUE), 0 = FALSE, 1 = TRUE.
- * stmt: ASN1_TYPE (ANY) — currently wraps the ATG token as V_ASN1_OCTET_STRING
- *       pending allocation of a real format OID (see ATG_STMT_TYPE_OID comment).
- * certs: STACK_OF(X509) — OPTIONAL; NULL means omitted (no chain returned by ATG yet).
- *        Only the `certificate` arm of LimitedCertChoices is supported for now.
+ * Definitions live in src/rats_csr_asn.c / src/rats_csr_asn.h so that the
+ * test binary can link against them without duplicating the struct layout.
  */
-typedef struct local_att_stmt_st {
-    ASN1_OBJECT  *type;
-    ASN1_BOOLEAN  bindsPublicKey; /* [0] IMPLICIT DEFAULT TRUE; -1 = absent (default) */
-    ASN1_TYPE    *stmt;           /* ANY — typed by type OID */
-    /* attrs [1] OPTIONAL: omitted (AttestAttrSet is empty in draft-22) */
-} LOCAL_ATT_STMT;
-
-ASN1_SEQUENCE(LOCAL_ATT_STMT) = {
-    ASN1_SIMPLE(LOCAL_ATT_STMT, type, ASN1_OBJECT),
-    ASN1_IMP_OPT(LOCAL_ATT_STMT, bindsPublicKey, ASN1_BOOLEAN, 0),
-    ASN1_SIMPLE(LOCAL_ATT_STMT, stmt, ASN1_ANY),
-} ASN1_SEQUENCE_END(LOCAL_ATT_STMT)
-IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_STMT)
-
-DEFINE_STACK_OF(LOCAL_ATT_STMT)
-
-typedef struct local_att_bundle_st {
-    STACK_OF(LOCAL_ATT_STMT) *attestations;
-    STACK_OF(X509)           *certs;   /* LimitedCertChoices OPTIONAL */
-} LOCAL_ATT_BUNDLE;
-
-ASN1_SEQUENCE(LOCAL_ATT_BUNDLE) = {
-    ASN1_SEQUENCE_OF(LOCAL_ATT_BUNDLE, attestations, LOCAL_ATT_STMT),
-    ASN1_SEQUENCE_OF_OPT(LOCAL_ATT_BUNDLE, certs, X509),
-} ASN1_SEQUENCE_END(LOCAL_ATT_BUNDLE)
-IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
+#include "rats_csr_asn.h"
 
 /*
  * OID: id-aa-attestation = 1.2.840.113549.1.9.16.2.59
@@ -580,41 +532,14 @@ IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
 
 /*
  * Placeholder OID for AttestationStatement.type.
- * The draft leaves format-specific OIDs to separate RFCs (e.g.,
- * draft-ietf-rats-eat for EAT).  Replace once the ATG token format OID is
- * allocated.
- * TODO: replace with the real vendor/IANA OID for the ATG JSON-EAT format.
+ * draft-ietf-lamps-csr-attestation-23 removed the central IANA attestation
+ * OID registry (PR #235).  Format OIDs are now self-managed: each format is
+ * identified by its own OID arc (vendor-assigned or defined by a format-
+ * specific RFC, e.g., draft-ietf-rats-eat for EAT).
+ * TODO: replace with the real vendor-allocated OID for the ATG token format.
  */
 #define ATG_STMT_TYPE_OID "1.3.6.1.4.1.99999.1"
 
-/*
- * ATT_BUNDLE_get_certs_from_der - extract the certificate chain from an
- * AttestationBundle DER blob.
- *
- * Decodes the DER-encoded AttestationBundle at |der| (length |der_len|) and
- * returns the `certs` field as a newly-allocated STACK_OF(X509).  Returns NULL
- * if the bundle cannot be decoded or contains no certificate chain.
- *
- * Caller is responsible for freeing the returned stack:
- *   sk_X509_pop_free(result, X509_free);
- */
-static STACK_OF(X509) *ATT_BUNDLE_get_certs_from_der(const unsigned char *der,
-                                                      long der_len)
-{
-    const unsigned char *p = der;
-    LOCAL_ATT_BUNDLE *bundle;
-    STACK_OF(X509) *certs;
-
-    bundle = d2i_LOCAL_ATT_BUNDLE(NULL, &p, der_len);
-    if (bundle == NULL)
-        return NULL;
-
-    /* Transfer ownership: pull certs out before freeing the bundle shell. */
-    certs = bundle->certs;
-    bundle->certs = NULL; /* prevent LOCAL_ATT_BUNDLE_free from releasing them */
-    LOCAL_ATT_BUNDLE_free(bundle);
-    return certs; /* NULL if the certs field was absent */
-}
 
 static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
                                            RATS_REQ *rats_config)
@@ -669,7 +594,7 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     }
 
     /*
-     * Build AttestationStatement { type OID, bindsPublicKey DEFAULT, stmt ANY }.
+     * Build AttestationStatement { type OID, stmt ANY }.
      * LOCAL_ATT_STMT_new() allocates all mandatory fields via ASN1_item_new.
      */
     stmt = LOCAL_ATT_STMT_new();
@@ -680,12 +605,6 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     stmt->type = OBJ_txt2obj(ATG_STMT_TYPE_OID, 1 /* dotted-decimal form */);
     if (stmt->type == NULL)
         goto err;
-    /*
-     * bindsPublicKey = 1 (explicit TRUE) → TRUE in DER encoding.
-     * The field is explicitly emitted; the verifier treats the statement as
-     * cryptographically bound to the CSR public key per the spec default.
-     */
-    stmt->bindsPublicKey = 1;
     /*
      * Set stmt (ANY): wrap raw ATG token bytes as OCTET STRING inside ASN1_TYPE.
      * When a real format OID is registered (see ATG_STMT_TYPE_OID), replace
