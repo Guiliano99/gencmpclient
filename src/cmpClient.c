@@ -27,7 +27,9 @@
 #ifdef LOCAL_DEFS
 # include "genericCMPClient_use.h"
 #endif
-#include <libatg.h>
+#ifdef USE_ATGLIB
+# include <libatg.h>
+#endif
 
 /*
  * Use cases are split between CMP use cases and others,
@@ -538,7 +540,8 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
  * specific RFC, e.g., draft-ietf-rats-eat for EAT).
  * TODO: replace with the real vendor-allocated OID for the ATG token format.
  */
-#define ATG_STMT_TYPE_OID "1.3.6.1.4.1.99999.1"
+#ifdef USE_ATGLIB
+# define ATG_STMT_TYPE_OID "1.3.6.1.4.1.99999.1"
 
 
 static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
@@ -678,9 +681,11 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     }
     return exts;
 }
+#endif /* USE_ATGLIB */
 
 static int add_rats_extensions(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config, X509_EXTENSIONS **exts)
 {
+#ifdef USE_ATGLIB
     int ret = 0;
     X509_EXTENSIONS *rats_exts;
 
@@ -691,6 +696,12 @@ static int add_rats_extensions(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config, X509_EX
         sk_X509_EXTENSION_pop_free(rats_exts, X509_EXTENSION_free);
     }
     return ret;
+#else
+    (void)ctx;
+    (void)rats_config;
+    (void)exts;
+    return 0;
+#endif
 }
 
 static int CMPclient_app_cb(OSSL_CMP_CTX *ctx, const void *app_cb_arg)
