@@ -622,8 +622,9 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     X509_EXTENSIONS *exts = NULL;
     X509_EXTENSION *ext = NULL;
     unsigned char *bundle_der = NULL;
-    int bundle_der_len = 0, ret = 0, atg_ret = -1;
+    int bundle_der_len = 0, ret = 0, atg_ret = -1, att_nid;
     ASN1_OCTET_STRING *oct_nonce;
+    ASN1_OCTET_STRING *token_os = NULL;
     ASN1_OCTET_STRING oct;
     struct token_req req;
     struct token_resp resp;
@@ -668,8 +669,8 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     }
 
     /*
-     * Build AttestationStatement { type OID, stmt OCTET STRING(token) }.
-     * LOCAL_ATT_STMT_new() initialises both pointer fields via ASN1_item_new.
+     * Build AttestationStatement { type OID, bindsPublicKey DEFAULT, stmt ANY }.
+     * LOCAL_ATT_STMT_new() allocates all mandatory fields via ASN1_item_new.
      */
     stmt = LOCAL_ATT_STMT_new();
     if (stmt == NULL)
@@ -679,9 +680,24 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     stmt->type = OBJ_txt2obj(ATG_STMT_TYPE_OID, 1 /* dotted-decimal form */);
     if (stmt->type == NULL)
         goto err;
-    if (!ASN1_OCTET_STRING_set(stmt->stmt,
-                               resp.token.buf, (int)resp.token.buf_size))
+    /*
+     * bindsPublicKey = 1 (explicit TRUE) → TRUE in DER encoding.
+     * The field is explicitly emitted; the verifier treats the statement as
+     * cryptographically bound to the CSR public key per the spec default.
+     */
+    stmt->bindsPublicKey = 1;
+    /*
+     * Set stmt (ANY): wrap raw ATG token bytes as OCTET STRING inside ASN1_TYPE.
+     * When a real format OID is registered (see ATG_STMT_TYPE_OID), replace
+     * V_ASN1_OCTET_STRING with the proper DER encoding for that format.
+     */
+    token_os = ASN1_OCTET_STRING_new();
+    if (token_os == NULL)
         goto err;
+    if (!ASN1_OCTET_STRING_set(token_os, resp.token.buf, (int)resp.token.buf_size))
+        goto err;
+    ASN1_TYPE_set(stmt->stmt, V_ASN1_OCTET_STRING, token_os);
+    token_os = NULL; /* ownership transferred to stmt->stmt */
 
     /*
      * Build AttestationBundle { attestations = [ stmt ] }.
@@ -707,7 +723,21 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     oct.data = bundle_der;
     oct.length = bundle_der_len;
     oct.flags = 0;
-    ext = X509_EXTENSION_create_by_NID(NULL, NID_id_aa_attestation,
+    /*
+     * Look up (and if needed register) id-aa-attestation at runtime.
+     * This makes the code independent of whether the build-time OpenSSL
+     * headers define NID_id_aa_attestation, and always produces the correct
+     * arc-.59 OID (1.2.840.113549.1.9.16.2.59) in the encoded extension.
+     */
+    att_nid = OBJ_txt2nid(ID_AA_ATTESTATION_OID);
+    if (att_nid == NID_undef)
+        att_nid = OBJ_create(ID_AA_ATTESTATION_OID,
+                             "id-aa-attestation", "id-aa-attestation");
+    if (att_nid == NID_undef) {
+        LOG_err("Failed to register id-aa-attestation OID");
+        goto err;
+    }
+    ext = X509_EXTENSION_create_by_NID(NULL, att_nid,
                                        0 /* not critical */, &oct);
     if (ext == NULL
         || (exts = sk_X509_EXTENSION_new_null()) == NULL
@@ -716,7 +746,8 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     ret = 1;
 
  err:
-    LOCAL_ATT_STMT_free(stmt);   /* no-op when stmt was transferred to bundle */
+    ASN1_OCTET_STRING_free(token_os); /* no-op if ownership transferred or never allocated */
+    LOCAL_ATT_STMT_free(stmt);        /* no-op when stmt was transferred to bundle */
     LOCAL_ATT_BUNDLE_free(bundle);
     OPENSSL_free(bundle_der);
     if (atg_ret == 0)
