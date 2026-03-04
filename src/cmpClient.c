@@ -587,6 +587,35 @@ IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
  */
 #define ATG_STMT_TYPE_OID "1.3.6.1.4.1.99999.1"
 
+/*
+ * ATT_BUNDLE_get_certs_from_der - extract the certificate chain from an
+ * AttestationBundle DER blob.
+ *
+ * Decodes the DER-encoded AttestationBundle at |der| (length |der_len|) and
+ * returns the `certs` field as a newly-allocated STACK_OF(X509).  Returns NULL
+ * if the bundle cannot be decoded or contains no certificate chain.
+ *
+ * Caller is responsible for freeing the returned stack:
+ *   sk_X509_pop_free(result, X509_free);
+ */
+static STACK_OF(X509) *ATT_BUNDLE_get_certs_from_der(const unsigned char *der,
+                                                      long der_len)
+{
+    const unsigned char *p = der;
+    LOCAL_ATT_BUNDLE *bundle;
+    STACK_OF(X509) *certs;
+
+    bundle = d2i_LOCAL_ATT_BUNDLE(NULL, &p, der_len);
+    if (bundle == NULL)
+        return NULL;
+
+    /* Transfer ownership: pull certs out before freeing the bundle shell. */
+    certs = bundle->certs;
+    bundle->certs = NULL; /* prevent LOCAL_ATT_BUNDLE_free from releasing them */
+    LOCAL_ATT_BUNDLE_free(bundle);
+    return certs; /* NULL if the certs field was absent */
+}
+
 static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
                                            RATS_REQ *rats_config)
 {
