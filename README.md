@@ -1,3 +1,20 @@
+# POC - Platform attestation with CMP
+
+ * Building process:  
+   * Dependency:  
+    [OpenSSL with RATS features](https://github.com/Guiliano99/openssl/tree/demo/docker_RATS2)
+
+   * Build command:  
+       ```USE_ATGLIB=1 make -f Makefile_v1```  
+       Note: Above command will also fetch [Attestation Token Generator (ATG)](https://code.siemens.com/ct-rda-cst-ses-de/remote-attestation/base-functionality/attestation-token-generator.git) and build it.
+ * Perform below steps to test.  
+      Open two terminal one for server and End entity and change directory to **test/recipes/80-test_cmp_http_data/Mock**.  
+     **server**   ```$openssl cmp -config server.cnf -verbosity 8 -port 1700```  
+     **client**   ```$../../../../cmpClient -server 127.0.0.1:1700 -config ../test.cnf -section "Mock commands" -no_proxy 127.0.0.1 -cmd cr -rats -rats_tokenname hello-world_json_none -rats_tokencfgpath "../../../../atg/install-atglib/etc/attestation/hello-world/token-cfg.json" -rats_plugincfgpath "../../../../atg/install-atglib/etc/attestation/plugins.json"```
+
+  
+ 
+
 # generic CMP client
 
 This is a generic [Certificate Management Protocol

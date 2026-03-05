@@ -34,6 +34,9 @@
 #ifdef LOCAL_DEFS
 # include "genericCMPClient_use.h"
 #endif
+#ifdef USE_ATGLIB
+# include <libatg.h>
+#endif
 
 #include "credential_loading.h"
 
@@ -49,6 +52,12 @@ enum use_case { no_use_case,
                 /* Non-CMP use cases: */
                 validate
 };
+
+typedef struct rats_req {
+    const char *tokenname;
+    const char *tokencfgpath;
+    const char *plugincfgpath;
+} RATS_REQ;
 
 #define RSA_SPEC "RSA:2048"
 #define ECC_SPEC "EC:prime256v1"
@@ -150,6 +159,10 @@ bool opt_implicit_confirm;
 bool opt_disable_confirm;
 const char *opt_certout;
 const char *opt_chainout;
+bool opt_rats;
+const char *opt_rats_tokenname;
+const char *opt_rats_tokencfgpath;
+const char *opt_rats_plugincfgpath;
 
 /* certificate enrollment and revocation */
 const char *opt_oldcert;
@@ -284,6 +297,15 @@ opt_t cmp_opts[] = {
       "File to save newly enrolled certificate, possibly with chain and key"},
     { "chainout", OPT_TXT, {.txt = NULL}, { &opt_chainout },
       "File to save the chain of the newly enrolled certificate"},
+    { "rats", OPT_BOOL, {.bit = false},
+      { (const char **) &opt_rats },
+      "Request certificate with remote attestation"},
+    { "rats_tokenname", OPT_TXT, {.txt = NULL}, { &opt_rats_tokenname },
+      "Token name for remote attestation"},
+    { "rats_tokencfgpath", OPT_TXT, {.txt = NULL}, { &opt_rats_tokencfgpath },
+      "Path to the RATS token configuration file"},
+    { "rats_plugincfgpath", OPT_TXT, {.txt = NULL}, { &opt_rats_plugincfgpath },
+      "Path to the RATS plugin configuration file"},
 
     OPT_HEADER("Certificate enrollment and revocation"),
     { "oldcert", OPT_TXT, {.txt = NULL}, { &opt_oldcert },
@@ -507,6 +529,208 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
     return res;
 }
 #endif
+
+/*
+ * Local ASN.1 types for AttestationBundle (draft-ietf-lamps-csr-attestation-22).
+ * Definitions live in src/rats_csr_asn.c / src/rats_csr_asn.h so that the
+ * test binary can link against them without duplicating the struct layout.
+ */
+#include "rats_csr_asn.h"
+
+/*
+ * OID: id-aa-attestation = 1.2.840.113549.1.9.16.2.59
+ * Early-allocated per draft-ietf-lamps-csr-attestation-22 §2 (arc .59 of id-aa).
+ *
+ * We look up (and if necessary register) this OID at runtime in getattestationExt()
+ * via OBJ_txt2nid / OBJ_create, so the code works correctly regardless of whether
+ * the build-time OpenSSL headers already define NID_id_aa_attestation.  This also
+ * removes the previous dependency on the Guiliano99 fork's arc-.999 placeholder.
+ */
+#define ID_AA_ATTESTATION_OID "1.2.840.113549.1.9.16.2.59"
+
+/*
+ * Placeholder OID for AttestationStatement.type.
+ * draft-ietf-lamps-csr-attestation-23 removed the central IANA attestation
+ * OID registry (PR #235).  Format OIDs are now self-managed: each format is
+ * identified by its own OID arc (vendor-assigned or defined by a format-
+ * specific RFC, e.g., draft-ietf-rats-eat for EAT).
+ * TODO: replace with the real vendor-allocated OID for the ATG token format.
+ */
+#ifdef USE_ATGLIB
+# define ATG_STMT_TYPE_OID "1.3.6.1.4.1.99999.1"
+
+
+static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
+                                           RATS_REQ *rats_config)
+{
+    X509_EXTENSIONS *exts = NULL;
+    X509_EXTENSION *ext = NULL;
+    unsigned char *bundle_der = NULL;
+    int bundle_der_len = 0, ret = 0, atg_ret = -1, att_nid;
+    ASN1_OCTET_STRING *oct_nonce;
+    ASN1_OCTET_STRING *token_os = NULL;
+    ASN1_OCTET_STRING oct;
+    struct token_req req;
+    struct token_resp resp;
+    LOCAL_ATT_STMT *stmt = NULL;
+    LOCAL_ATT_BUNDLE *bundle = NULL;
+
+    if (rats_config == NULL)
+        goto err;
+
+    req.token_name = (char *)rats_config->tokenname;
+    req.config_path = (char *) rats_config->tokencfgpath;
+    req.plugconf_path = (char *)rats_config->plugincfgpath;
+
+    oct_nonce = OSSL_CMP_CTX_get0_rats_nonce(ctx);
+    if (oct_nonce == NULL) {
+        LOG_err("Error: No nonce available for remote attestation");
+        goto err;
+    }
+    req.nonce = oct_nonce->data;
+    req.nonce_size = oct_nonce->length;
+    req.user_data_size = 0;
+
+    atg_ret = atg_generate_evidence(req, &resp);
+    if (atg_ret != 0) {
+        printf("An error has occurred in generating attestation token, return code - %d\n", atg_ret);
+        printf("Token request details:\n");
+        printf("Token Name: %s\n", req.token_name);
+        printf("Config Path: %s\n", req.config_path);
+        printf("Plugin Config Path: %s\n", req.plugconf_path);
+        printf("\nNonce Size: %zu\n", req.nonce_size);
+        printf("Nonce: ");
+        for (size_t i = 0; i < req.nonce_size; i++)
+            printf("0x%x ", req.nonce[i] & 0xff);
+        printf("\nUser Data Size: %zu\n\n", req.user_data_size);
+        goto err;
+    }
+    printf("Token size: %lu\n", resp.token.buf_size);
+
+    if (resp.num_submods > 0) {
+        printf("Error: submodules are not supported.\n");
+        goto err;
+    }
+
+    /*
+     * Build AttestationStatement { type OID, stmt ANY }.
+     * LOCAL_ATT_STMT_new() allocates all mandatory fields via ASN1_item_new.
+     */
+    stmt = LOCAL_ATT_STMT_new();
+    if (stmt == NULL)
+        goto err;
+    /* Replace the default-initialised empty OID with the token-format OID. */
+    ASN1_OBJECT_free(stmt->type);
+    stmt->type = OBJ_txt2obj(ATG_STMT_TYPE_OID, 1 /* dotted-decimal form */);
+    if (stmt->type == NULL)
+        goto err;
+    /*
+     * Set stmt (ANY): wrap raw ATG token bytes as OCTET STRING inside ASN1_TYPE.
+     * When a real format OID is registered (see ATG_STMT_TYPE_OID), replace
+     * V_ASN1_OCTET_STRING with the proper DER encoding for that format.
+     */
+    token_os = ASN1_OCTET_STRING_new();
+    if (token_os == NULL)
+        goto err;
+    if (!ASN1_OCTET_STRING_set(token_os, resp.token.buf, (int)resp.token.buf_size))
+        goto err;
+    ASN1_TYPE_set(stmt->stmt, V_ASN1_OCTET_STRING, token_os);
+    token_os = NULL; /* ownership transferred to stmt->stmt */
+
+    /*
+     * Build AttestationBundle { attestations = [ stmt ] }.
+     * LOCAL_ATT_BUNDLE_new() may leave attestations as NULL; allocate if so.
+     */
+    bundle = LOCAL_ATT_BUNDLE_new();
+    if (bundle == NULL)
+        goto err;
+    if (bundle->attestations == NULL) {
+        bundle->attestations = sk_LOCAL_ATT_STMT_new_null();
+        if (bundle->attestations == NULL)
+            goto err;
+    }
+    if (!sk_LOCAL_ATT_STMT_push(bundle->attestations, stmt))
+        goto err;
+    stmt = NULL; /* ownership transferred to bundle */
+
+    /* DER-encode the AttestationBundle; this becomes the extension extnValue. */
+    bundle_der_len = i2d_LOCAL_ATT_BUNDLE(bundle, &bundle_der);
+    if (bundle_der_len < 0)
+        goto err;
+
+    oct.data = bundle_der;
+    oct.length = bundle_der_len;
+    oct.flags = 0;
+    /*
+     * Look up (and if needed register) id-aa-attestation at runtime.
+     * This makes the code independent of whether the build-time OpenSSL
+     * headers define NID_id_aa_attestation, and always produces the correct
+     * arc-.59 OID (1.2.840.113549.1.9.16.2.59) in the encoded extension.
+     */
+    att_nid = OBJ_txt2nid(ID_AA_ATTESTATION_OID);
+    if (att_nid == NID_undef)
+        att_nid = OBJ_create(ID_AA_ATTESTATION_OID,
+                             "id-aa-attestation", "id-aa-attestation");
+    if (att_nid == NID_undef) {
+        LOG_err("Failed to register id-aa-attestation OID");
+        goto err;
+    }
+    ext = X509_EXTENSION_create_by_NID(NULL, att_nid,
+                                       0 /* not critical */, &oct);
+    if (ext == NULL
+        || (exts = sk_X509_EXTENSION_new_null()) == NULL
+        || !sk_X509_EXTENSION_push(exts, ext))
+        goto err;
+    ret = 1;
+
+ err:
+    ASN1_OCTET_STRING_free(token_os); /* no-op if ownership transferred or never allocated */
+    LOCAL_ATT_STMT_free(stmt);        /* no-op when stmt was transferred to bundle */
+    LOCAL_ATT_BUNDLE_free(bundle);
+    OPENSSL_free(bundle_der);
+    if (atg_ret == 0)
+        atg_free_attestation_token(resp);
+    if (ret == 0) {
+        X509_EXTENSION_free(ext);
+        sk_X509_EXTENSION_free(exts);
+        exts = NULL;
+    }
+    return exts;
+}
+#endif /* USE_ATGLIB */
+
+static int add_rats_extensions(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config, X509_EXTENSIONS **exts)
+{
+#ifdef USE_ATGLIB
+    int ret = 0;
+    X509_EXTENSIONS *rats_exts;
+
+    if (exts == NULL)
+        return 0;
+    if ((rats_exts = getattestationExt(ctx, rats_config)) != NULL) {
+        ret = X509v3_add_extensions(exts, rats_exts) != NULL;
+        sk_X509_EXTENSION_pop_free(rats_exts, X509_EXTENSION_free);
+    }
+    return ret;
+#else
+    (void)ctx;
+    (void)rats_config;
+    (void)exts;
+    return 0;
+#endif
+}
+
+static int CMPclient_app_cb(OSSL_CMP_CTX *ctx, const void *app_cb_arg)
+{
+
+    if (OSSL_CMP_CTX_get_option(ctx, OSSL_CMP_OPT_INIT_RATS)) {
+        X509_EXTENSIONS *req_exts = OSSL_CMP_CTX_get0_reqExtensions(ctx);
+
+        if (!add_rats_extensions(ctx, (RATS_REQ *)app_cb_arg, &req_exts))
+            return 0;
+    }
+    return 1;
+}
 
 static int set_gennames(OSSL_CMP_CTX *ctx, char *names, const char *desc)
 {
@@ -1097,10 +1321,33 @@ static int setup_ctx(CMP_CTX *ctx)
         || !OSSL_CMP_CTX_set_option(ctx, OSSL_CMP_OPT_DISABLE_CONFIRM,
                                     opt_disable_confirm ? 1 : 0)
         || !OSSL_CMP_CTX_set_option(ctx, OSSL_CMP_OPT_UNPROTECTED_SEND,
-                                    opt_unprotected_requests ? 1 : 0)) {
+                                    opt_unprotected_requests ? 1 : 0)
+        || !OSSL_CMP_CTX_set_option(ctx, OSSL_CMP_OPT_INIT_RATS,
+                                    opt_rats ? 1 : 0)) {
         LOG_err("Failed to set option flags of CMP context");
         goto err;
     }
+    if (opt_rats) {
+        struct rats_req *rats_config;
+
+        if (opt_rats_tokenname == NULL
+            || opt_rats_tokencfgpath == NULL
+            || opt_rats_plugincfgpath == NULL) {
+            LOG_err("Missing -rats_tokenname or -rats_tokencfgpath or -rats_plugincfgpath option");
+            goto err;
+        }
+        rats_config = OPENSSL_malloc(sizeof(struct rats_req));
+        if (rats_config == NULL) {
+            LOG_err("Failed to allocate memory for RATS configuration");
+            goto err;
+        }
+        rats_config->tokenname = opt_rats_tokenname;
+        rats_config->tokencfgpath = opt_rats_tokencfgpath;
+        rats_config->plugincfgpath = opt_rats_plugincfgpath;
+        (void) OSSL_CMP_CTX_set_certreq_cb(ctx, CMPclient_app_cb);
+        (void) OSSL_CMP_CTX_set_certreq_cb_arg(ctx, (void *)rats_config);
+    }
+
 
     if (opt_profile != NULL) {
 #if OPENSSL_3_3_FEATURES
