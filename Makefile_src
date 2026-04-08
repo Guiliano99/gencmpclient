@@ -198,7 +198,7 @@ else
     override CFLAGS += -D_FORTIFY_SOURCE=2
 endif
 
-OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ)
+OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ)
 
 SRCS = $(OBJS:$(OBJ)=.c)
 
