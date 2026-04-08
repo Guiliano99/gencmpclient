@@ -151,6 +151,7 @@ bool opt_rats;
 const char *opt_rats_tokenname;
 const char *opt_rats_tokencfgpath;
 const char *opt_rats_plugincfgpath;
+const char *opt_rats_hint;
 
 /* certificate enrollment and revocation */
 const char *opt_oldcert;
@@ -292,6 +293,8 @@ opt_t cmp_opts[] = {
       "Path to the RATS token configuration file"},
     { "rats_plugincfgpath", OPT_TXT, {.txt = NULL}, { &opt_rats_plugincfgpath },
       "Path to the RATS plugin configuration file"},
+    { "rats_hint", OPT_TXT, {.txt = NULL}, { &opt_rats_hint },
+      "Verifier hint (FQDN/URI) for the RATS nonce request"},
 
     OPT_HEADER("Certificate enrollment and revocation"),
     { "oldcert", OPT_TXT, {.txt = NULL}, { &opt_oldcert },
@@ -1314,6 +1317,11 @@ static int setup_ctx(CMP_CTX *ctx)
         rats_config->plugincfgpath = opt_rats_plugincfgpath;
         (void) OSSL_CMP_CTX_set_certreq_cb(ctx, CMPclient_app_cb);
         (void) OSSL_CMP_CTX_set_certreq_cb_arg(ctx, (void *)rats_config);
+        if (opt_rats_hint != NULL
+                && !OSSL_CMP_CTX_set1_nonce_hint(ctx, opt_rats_hint)) {
+            LOG_err("Failed to set RATS nonce hint");
+            goto err;
+        }
     }
 
 
