@@ -250,7 +250,7 @@ $(OUT_DIR)/$(OUTLIBV): | clean_libcmp_a
 $(OUT_DIR)/$(OUTLIBV): $(OUT_DIR)/$(LIBCMP_A)
    endif
 endif
-$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ)
+$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ)
 	$(CC) $^ $(LDFLAGS) $(LIBS) -shared -o $@ -Wl,-$(SONAME)$(OUTLIBV)
 
 $(OUT_DIR)/$(OUTLIB): $(OUT_DIR)/$(OUTLIBV)
