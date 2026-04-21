@@ -1,15 +1,14 @@
 /*-
  * @file   src/rats_csr_asn.h
  * @brief  Local ASN.1 types for AttestationBundle
- *         (draft-ietf-lamps-csr-attestation-23).
+ *         (draft-ietf-lamps-csr-attestation-24).
  *
  * These are temporary stand-ins until OSSL_CSR_ATTESTATION_STATEMENT and
  * OSSL_CSR_ATTESTATION_BUNDLE are added to crypto/crmf/crmf_asn.c in the
  * Guiliano99/openssl fork.  Once the fork provides those types, replace
  * LOCAL_ATT_STMT / LOCAL_ATT_BUNDLE with the upstream definitions.
  *
- * Encoded structure (draft-ietf-lamps-csr-attestation-23 §4,
- *   pending PR #236 which removes bindsPublicKey and attrs):
+ * Encoded structure per draft-ietf-lamps-csr-attestation-24 Appendix B:
  *
  *   AttestationStatement ::= SEQUENCE {
  *       type  ATTESTATION-STATEMENT.&id,   -- OID
@@ -47,6 +46,42 @@ typedef struct local_att_bundle_st {
 } LOCAL_ATT_BUNDLE;
 
 DECLARE_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
+
+/* ── TCG TPM2 attestation statement types ────────────────────────────────────
+ *
+ * draft-birkholz-rats-tcg-tpm2-attestation defines two statement types:
+ *
+ *   TcgAttestCertify ::= SEQUENCE {      -- OID 2.23.133.20.1 (key attestation)
+ *       tpmSAttest  OCTET STRING,
+ *       signature   OCTET STRING,
+ *       tpmTPublic  OCTET STRING OPTIONAL
+ *   }
+ *
+ *   TcgAttestQuote ::= SEQUENCE {        -- OID 2.23.133.20.2 (platform attestation)
+ *       tpmSAttest  OCTET STRING,
+ *       signature   OCTET STRING,
+ *       pcrValues   OCTET STRING OPTIONAL
+ *   }
+ *
+ * These types are used by getTPMAttestExtFromFiles() in cmpClient.c to build
+ * an id-aa-attestation CSR extension directly from on-disk TPM binary blobs,
+ * without going through the ATG library.
+ */
+typedef struct tcg_attest_certify_st {
+    ASN1_OCTET_STRING *tpmSAttest;
+    ASN1_OCTET_STRING *signature;
+    ASN1_OCTET_STRING *tpmTPublic; /* OPTIONAL */
+} TCG_ATTEST_CERTIFY;
+
+DECLARE_ASN1_FUNCTIONS(TCG_ATTEST_CERTIFY)
+
+typedef struct tcg_attest_quote_st {
+    ASN1_OCTET_STRING *tpmSAttest;
+    ASN1_OCTET_STRING *signature;
+    ASN1_OCTET_STRING *pcrValues;  /* OPTIONAL */
+} TCG_ATTEST_QUOTE;
+
+DECLARE_ASN1_FUNCTIONS(TCG_ATTEST_QUOTE)
 
 /*
  * ATT_BUNDLE_get_certs_from_der - extract the certificate chain from an

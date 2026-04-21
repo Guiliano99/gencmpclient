@@ -153,6 +153,15 @@ const char *opt_rats_tokencfgpath;
 const char *opt_rats_plugincfgpath;
 const char *opt_rats_hint;
 
+/* TPM attestation file paths — alternative to the ATG library (-rats).
+ * When --tpms_attest is provided the client builds an id-aa-attestation
+ * CSR extension directly from the binary blobs without libatg. */
+const char *opt_tpms_attest;      /* TPMS_ATTEST binary blob */
+const char *opt_ak_sig;           /* AK signature binary */
+const char *opt_tpmt_public;      /* TPMT_PUBLIC binary  (certify / key attestation) */
+const char *opt_pcr_values;       /* PCR values binary   (quote / platform attestation) */
+const char *opt_tpm_attest_type;  /* "certify" (default) | "quote" */
+
 /* certificate enrollment and revocation */
 const char *opt_oldcert;
 long opt_revreason;
@@ -295,6 +304,17 @@ opt_t cmp_opts[] = {
       "Path to the RATS plugin configuration file"},
     { "rats_hint", OPT_TXT, {.txt = NULL}, { &opt_rats_hint },
       "Verifier hint (FQDN/URI) for the RATS nonce request"},
+    { "tpms_attest", OPT_TXT, {.txt = NULL}, { &opt_tpms_attest },
+      "File containing TPMS_ATTEST binary blob (enables TPM file-based attestation)"},
+    { "ak_sig", OPT_TXT, {.txt = NULL}, { &opt_ak_sig },
+      "File containing AK signature binary for TPM attestation"},
+    { "tpmt_public", OPT_TXT, {.txt = NULL}, { &opt_tpmt_public },
+      "File containing TPMT_PUBLIC binary (TcgAttestCertify, key attestation)"},
+    { "pcr_values", OPT_TXT, {.txt = NULL}, { &opt_pcr_values },
+      "File containing PCR values binary (TcgAttestQuote, platform attestation)"},
+    { "tpm_attest_type", OPT_TXT, {.txt = "certify"}, { &opt_tpm_attest_type },
+      "TPM attestation statement type: \"certify\" (TcgAttestCertify, OID 2.23.133.20.1, default)"},
+    OPT_MORE("or \"quote\" (TcgAttestQuote, OID 2.23.133.20.2)"),
 
     OPT_HEADER("Certificate enrollment and revocation"),
     { "oldcert", OPT_TXT, {.txt = NULL}, { &opt_oldcert },
@@ -518,7 +538,7 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
 #endif
 
 /*
- * Local ASN.1 types for AttestationBundle (draft-ietf-lamps-csr-attestation-22).
+ * Local ASN.1 types for AttestationBundle (draft-ietf-lamps-csr-attestation-24).
  * Definitions live in src/rats_csr_asn.c / src/rats_csr_asn.h so that the
  * test binary can link against them without duplicating the struct layout.
  */
@@ -526,25 +546,194 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
 
 /*
  * OID: id-aa-attestation = 1.2.840.113549.1.9.16.2.59
- * Early-allocated per draft-ietf-lamps-csr-attestation-22 §2 (arc .59 of id-aa).
+ * Defined in draft-ietf-lamps-csr-attestation-24 §5 as { id-aa 59 }.
  *
- * We look up (and if necessary register) this OID at runtime in getattestationExt()
- * via OBJ_txt2nid / OBJ_create, so the code works correctly regardless of whether
- * the build-time OpenSSL headers already define NID_id_aa_attestation.  This also
+ * We look up (and if necessary register) this OID at runtime via
+ * OBJ_txt2nid / OBJ_create, so the code works correctly regardless of whether
+ * the build-time OpenSSL headers already define NID_id_aa_attestation.  This
  * removes the previous dependency on the Guiliano99 fork's arc-.999 placeholder.
  */
 #define ID_AA_ATTESTATION_OID "1.2.840.113549.1.9.16.2.59"
 
 /*
- * Placeholder OID for AttestationStatement.type.
- * draft-ietf-lamps-csr-attestation-23 removed the central IANA attestation
- * OID registry (PR #235).  Format OIDs are now self-managed: each format is
- * identified by its own OID arc (vendor-assigned or defined by a format-
- * specific RFC, e.g., draft-ietf-rats-eat for EAT).
+ * Placeholder OID for AttestationStatement.type (ATG plugin token format).
+ * draft-ietf-lamps-csr-attestation-24 leaves AttestationStatementSet
+ * unconstrained ("None defined in this document"); format OIDs are
+ * self-managed per vendor arc.
  * TODO: replace with the real vendor-allocated OID for the ATG token format.
  */
 #ifdef USE_ATGLIB
 # define ATG_STMT_TYPE_OID "1.3.6.1.4.1.99999.1"
+#endif
+
+/*
+ * TCG TPM2 attestation OIDs (draft-birkholz-rats-tcg-tpm2-attestation).
+ * Used by getTPMAttestExtFromFiles() — available regardless of USE_ATGLIB.
+ */
+#define TCG_ATTEST_CERTIFY_OID "2.23.133.20.1"  /* TcgAttestCertify — key attestation    */
+#define TCG_ATTEST_QUOTE_OID   "2.23.133.20.2"  /* TcgAttestQuote   — platform attestation */
+
+/*
+ * getTPMAttestExtFromFiles - build id-aa-attestation CSR extension from TPM blobs.
+ *
+ * Reads TPMS_ATTEST and AK signature from @tpms_attest_path / @ak_sig_path,
+ * and the optional @blob_path (TPMT_PUBLIC for "certify", PCR values for
+ * "quote").  @type_str selects "certify" (TcgAttestCertify, OID 2.23.133.20.1)
+ * or "quote" (TcgAttestQuote, OID 2.23.133.20.2).
+ *
+ * Returns a newly-allocated X509_EXTENSIONS * on success, NULL on failure.
+ * The caller must free it with sk_X509_EXTENSION_pop_free(…, X509_EXTENSION_free).
+ */
+static X509_EXTENSIONS *getTPMAttestExtFromFiles(const char *tpms_attest_path,
+                                                  const char *ak_sig_path,
+                                                  const char *blob_path,
+                                                  const char *type_str)
+{
+    X509_EXTENSIONS *exts = NULL;
+    X509_EXTENSION  *ext  = NULL;
+    unsigned char   *tpms_buf = NULL, *sig_buf = NULL, *blob_buf = NULL;
+    long             tpms_len = 0,     sig_len = 0,     blob_len = 0;
+    unsigned char   *stmt_der = NULL, *bundle_der = NULL;
+    int              stmt_der_len = 0, bundle_der_len = 0;
+    int              ret = 0, att_nid, is_quote = 0;
+    const char      *type_oid_str;
+    ASN1_OCTET_STRING oct;
+    LOCAL_ATT_STMT  *stmt   = NULL;
+    LOCAL_ATT_BUNDLE *bundle = NULL;
+
+    if (tpms_attest_path == NULL || ak_sig_path == NULL) {
+        LOG_err("--tpms_attest and --ak_sig are required for TPM file-based attestation");
+        return NULL;
+    }
+
+    is_quote     = (type_str != NULL && strcmp(type_str, "quote") == 0);
+    type_oid_str = is_quote ? TCG_ATTEST_QUOTE_OID : TCG_ATTEST_CERTIFY_OID;
+
+    /* ── Read binary blobs from files ───────────────────────────────────────── */
+#define TPM_READ_FILE(path, buf, len) do {                           \
+        FILE *_fp = fopen((path), "rb");                             \
+        long _sz;                                                    \
+        if (_fp == NULL) {                                           \
+            LOG(FL_ERR, "Cannot open TPM blob file: %s", (path));   \
+            goto err;                                                \
+        }                                                            \
+        fseek(_fp, 0, SEEK_END); _sz = ftell(_fp); rewind(_fp);     \
+        (buf) = OPENSSL_malloc(_sz);                                 \
+        if ((buf) == NULL || fread((buf), 1, _sz, _fp) != (size_t)_sz) { \
+            OPENSSL_free(buf); fclose(_fp);                          \
+            LOG(FL_ERR, "Cannot read TPM blob file: %s", (path));   \
+            goto err;                                                \
+        }                                                            \
+        fclose(_fp); (len) = _sz;                                    \
+} while (0)
+
+    TPM_READ_FILE(tpms_attest_path, tpms_buf, tpms_len);
+    TPM_READ_FILE(ak_sig_path,      sig_buf,  sig_len);
+    if (blob_path != NULL)
+        TPM_READ_FILE(blob_path, blob_buf, blob_len);
+#undef TPM_READ_FILE
+
+    /* ── Build TcgAttestCertify or TcgAttestQuote DER ───────────────────────── */
+    if (is_quote) {
+        TCG_ATTEST_QUOTE *q = TCG_ATTEST_QUOTE_new();
+        if (q == NULL) goto err;
+        if (!ASN1_OCTET_STRING_set(q->tpmSAttest, tpms_buf, (int)tpms_len)
+            || !ASN1_OCTET_STRING_set(q->signature, sig_buf, (int)sig_len)
+            || (blob_buf != NULL
+                && !ASN1_OCTET_STRING_set(q->pcrValues, blob_buf, (int)blob_len))) {
+            TCG_ATTEST_QUOTE_free(q);
+            goto err;
+        }
+        stmt_der_len = i2d_TCG_ATTEST_QUOTE(q, &stmt_der);
+        TCG_ATTEST_QUOTE_free(q);
+    } else {
+        TCG_ATTEST_CERTIFY *c = TCG_ATTEST_CERTIFY_new();
+        if (c == NULL) goto err;
+        if (!ASN1_OCTET_STRING_set(c->tpmSAttest, tpms_buf, (int)tpms_len)
+            || !ASN1_OCTET_STRING_set(c->signature, sig_buf, (int)sig_len)
+            || (blob_buf != NULL
+                && !ASN1_OCTET_STRING_set(c->tpmTPublic, blob_buf, (int)blob_len))) {
+            TCG_ATTEST_CERTIFY_free(c);
+            goto err;
+        }
+        stmt_der_len = i2d_TCG_ATTEST_CERTIFY(c, &stmt_der);
+        TCG_ATTEST_CERTIFY_free(c);
+    }
+    if (stmt_der_len <= 0) {
+        LOG_err("Failed to DER-encode TPM attestation statement");
+        goto err;
+    }
+
+    /* ── Build AttestationStatement { type OID, stmt ANY } ──────────────────── */
+    stmt = LOCAL_ATT_STMT_new();
+    if (stmt == NULL) goto err;
+    ASN1_OBJECT_free(stmt->type);
+    stmt->type = OBJ_txt2obj(type_oid_str, 1);
+    if (stmt->type == NULL) goto err;
+    /* Set stmt (ANY) to the DER-encoded TcgAttest* SEQUENCE.
+     * V_ASN1_SEQUENCE + ASN1_STRING holding the full DER bytes is the
+     * standard way to embed a pre-encoded SEQUENCE into ASN1_TYPE. */
+    {
+        ASN1_STRING *der_str = ASN1_STRING_new();
+        if (der_str == NULL) goto err;
+        if (!ASN1_STRING_set(der_str, stmt_der, stmt_der_len)) {
+            ASN1_STRING_free(der_str);
+            goto err;
+        }
+        ASN1_TYPE_set(stmt->stmt, V_ASN1_SEQUENCE, der_str);
+    }
+
+    /* ── Build AttestationBundle { attestations = [ stmt ] } ────────────────── */
+    bundle = LOCAL_ATT_BUNDLE_new();
+    if (bundle == NULL) goto err;
+    if (bundle->attestations == NULL) {
+        bundle->attestations = sk_LOCAL_ATT_STMT_new_null();
+        if (bundle->attestations == NULL) goto err;
+    }
+    if (!sk_LOCAL_ATT_STMT_push(bundle->attestations, stmt)) goto err;
+    stmt = NULL; /* ownership transferred */
+
+    bundle_der_len = i2d_LOCAL_ATT_BUNDLE(bundle, &bundle_der);
+    if (bundle_der_len < 0) goto err;
+
+    /* ── Create id-aa-attestation X.509 extension ──────────────────────────────── */
+    oct.data   = bundle_der;
+    oct.length = bundle_der_len;
+    oct.flags  = 0;
+    att_nid = OBJ_txt2nid(ID_AA_ATTESTATION_OID);
+    if (att_nid == NID_undef)
+        att_nid = OBJ_create(ID_AA_ATTESTATION_OID,
+                             "id-aa-attestation", "id-aa-attestation");
+    if (att_nid == NID_undef) {
+        LOG_err("Failed to register id-aa-attestation OID");
+        goto err;
+    }
+    ext = X509_EXTENSION_create_by_NID(NULL, att_nid, 0 /* non-critical */, &oct);
+    if (ext == NULL
+        || (exts = sk_X509_EXTENSION_new_null()) == NULL
+        || !sk_X509_EXTENSION_push(exts, ext))
+        goto err;
+    ret = 1;
+    LOG(FL_DEBUG, "Built TPM %s attestation extension (%s, %d bytes DER)",
+        is_quote ? "quote" : "certify", type_oid_str, bundle_der_len);
+
+ err:
+    OPENSSL_free(tpms_buf);
+    OPENSSL_free(sig_buf);
+    OPENSSL_free(blob_buf);
+    OPENSSL_free(stmt_der);
+    OPENSSL_free(bundle_der);
+    LOCAL_ATT_STMT_free(stmt);
+    LOCAL_ATT_BUNDLE_free(bundle);
+    if (ret == 0) {
+        X509_EXTENSION_free(ext);
+        sk_X509_EXTENSION_free(exts);
+        exts = NULL;
+    }
+    return exts;
+}
+
+#ifdef USE_ATGLIB
 
 
 static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
@@ -688,23 +877,37 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
 
 static int add_rats_extensions(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config, X509_EXTENSIONS **exts)
 {
-#ifdef USE_ATGLIB
+    X509_EXTENSIONS *rats_exts = NULL;
     int ret = 0;
-    X509_EXTENSIONS *rats_exts;
 
     if (exts == NULL)
         return 0;
-    if ((rats_exts = getattestationExt(ctx, rats_config)) != NULL) {
+
+    /* TPM file-based path: build TcgAttestCertify/TcgAttestQuote from blobs. */
+    if (opt_tpms_attest != NULL) {
+        const char *blob = (opt_tpm_attest_type != NULL
+                            && strcmp(opt_tpm_attest_type, "quote") == 0)
+                           ? opt_pcr_values : opt_tpmt_public;
+        rats_exts = getTPMAttestExtFromFiles(opt_tpms_attest, opt_ak_sig,
+                                              blob, opt_tpm_attest_type);
+    }
+#ifdef USE_ATGLIB
+    /* ATG library path: generate EAT token via libatg. */
+    else {
+        rats_exts = getattestationExt(ctx, rats_config);
+    }
+#else
+    else {
+        (void)ctx;
+        (void)rats_config;
+    }
+#endif
+
+    if (rats_exts != NULL) {
         ret = X509v3_add_extensions(exts, rats_exts) != NULL;
         sk_X509_EXTENSION_pop_free(rats_exts, X509_EXTENSION_free);
     }
     return ret;
-#else
-    (void)ctx;
-    (void)rats_config;
-    (void)exts;
-    return 0;
-#endif
 }
 
 static int CMPclient_app_cb(OSSL_CMP_CTX *ctx, const void *app_cb_arg)
@@ -1294,27 +1497,38 @@ static int setup_ctx(CMP_CTX *ctx)
         || !OSSL_CMP_CTX_set_option(ctx, OSSL_CMP_OPT_UNPROTECTED_SEND,
                                     opt_unprotected_requests ? 1 : 0)
         || !OSSL_CMP_CTX_set_option(ctx, OSSL_CMP_OPT_INIT_RATS,
-                                    opt_rats ? 1 : 0)) {
+                                    (opt_rats || opt_tpms_attest != NULL) ? 1 : 0)) {
         LOG_err("Failed to set option flags of CMP context");
         goto err;
     }
-    if (opt_rats) {
-        struct rats_req *rats_config;
+    if (opt_rats || opt_tpms_attest != NULL) {
+        struct rats_req *rats_config = NULL;
 
-        if (opt_rats_tokenname == NULL
-            || opt_rats_tokencfgpath == NULL
-            || opt_rats_plugincfgpath == NULL) {
-            LOG_err("Missing -rats_tokenname or -rats_tokencfgpath or -rats_plugincfgpath option");
-            goto err;
+        if (opt_tpms_attest != NULL) {
+            /* TPM file-based path — no ATG library config needed.
+             * ak_sig is mandatory; tpmt_public / pcr_values are optional blobs. */
+            if (opt_ak_sig == NULL) {
+                LOG_err("--ak_sig is required when --tpms_attest is given");
+                goto err;
+            }
+        } else {
+            /* ATG library path — token name + config files required. */
+            if (opt_rats_tokenname == NULL
+                || opt_rats_tokencfgpath == NULL
+                || opt_rats_plugincfgpath == NULL) {
+                LOG_err("Missing -rats_tokenname or -rats_tokencfgpath"
+                        " or -rats_plugincfgpath option");
+                goto err;
+            }
+            rats_config = OPENSSL_malloc(sizeof(struct rats_req));
+            if (rats_config == NULL) {
+                LOG_err("Failed to allocate memory for RATS configuration");
+                goto err;
+            }
+            rats_config->tokenname    = opt_rats_tokenname;
+            rats_config->tokencfgpath = opt_rats_tokencfgpath;
+            rats_config->plugincfgpath = opt_rats_plugincfgpath;
         }
-        rats_config = OPENSSL_malloc(sizeof(struct rats_req));
-        if (rats_config == NULL) {
-            LOG_err("Failed to allocate memory for RATS configuration");
-            goto err;
-        }
-        rats_config->tokenname = opt_rats_tokenname;
-        rats_config->tokencfgpath = opt_rats_tokencfgpath;
-        rats_config->plugincfgpath = opt_rats_plugincfgpath;
         (void) OSSL_CMP_CTX_set_certreq_cb(ctx, CMPclient_app_cb);
         (void) OSSL_CMP_CTX_set_certreq_cb_arg(ctx, (void *)rats_config);
         if (opt_rats_hint != NULL

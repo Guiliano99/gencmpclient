@@ -1,7 +1,7 @@
 /*-
  * @file   src/rats_csr_asn.c
  * @brief  ASN.1 type definitions for AttestationBundle
- *         (draft-ietf-lamps-csr-attestation-23).
+ *         (draft-ietf-lamps-csr-attestation-24).
  *
  * Provides the IMPLEMENT_ASN1_FUNCTIONS for LOCAL_ATT_STMT and
  * LOCAL_ATT_BUNDLE, and the ATT_BUNDLE_get_certs_from_der() helper.
@@ -23,6 +23,20 @@ ASN1_SEQUENCE(LOCAL_ATT_BUNDLE) = {
     ASN1_SEQUENCE_OF_OPT(LOCAL_ATT_BUNDLE, certs, X509),
 } ASN1_SEQUENCE_END(LOCAL_ATT_BUNDLE)
 IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
+
+ASN1_SEQUENCE(TCG_ATTEST_CERTIFY) = {
+    ASN1_SIMPLE(TCG_ATTEST_CERTIFY, tpmSAttest, ASN1_OCTET_STRING),
+    ASN1_SIMPLE(TCG_ATTEST_CERTIFY, signature,  ASN1_OCTET_STRING),
+    ASN1_OPT(TCG_ATTEST_CERTIFY,    tpmTPublic, ASN1_OCTET_STRING),
+} ASN1_SEQUENCE_END(TCG_ATTEST_CERTIFY)
+IMPLEMENT_ASN1_FUNCTIONS(TCG_ATTEST_CERTIFY)
+
+ASN1_SEQUENCE(TCG_ATTEST_QUOTE) = {
+    ASN1_SIMPLE(TCG_ATTEST_QUOTE, tpmSAttest, ASN1_OCTET_STRING),
+    ASN1_SIMPLE(TCG_ATTEST_QUOTE, signature,  ASN1_OCTET_STRING),
+    ASN1_OPT(TCG_ATTEST_QUOTE,    pcrValues,  ASN1_OCTET_STRING),
+} ASN1_SEQUENCE_END(TCG_ATTEST_QUOTE)
+IMPLEMENT_ASN1_FUNCTIONS(TCG_ATTEST_QUOTE)
 
 STACK_OF(X509) *ATT_BUNDLE_get_certs_from_der(const unsigned char *der,
                                                long der_len)
