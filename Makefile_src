@@ -138,6 +138,11 @@ ifdef SECUTILS_USE_UTA
     override LIBS += -luta
 endif
 
+# TPM 2.0 direct-access libraries for src/tpm_ops.c.  Used for in-process
+# Esys_Certify calls that cannot go through the tpm2-openssl provider (which
+# does not expose Certify/Quote).  See src/tpm_ops.h for the contract.
+override LIBS += -ltss2-esys -ltss2-tctildr -ltss2-mu -ltss2-rc
+
 override LDFLAGS += $(DEBUG_FLAGS) # needed for -fsanitize=...
 ifeq ($(LPATH),)
     override LDFLAGS += -L $(PREFIX)$(OUT_DIR)
@@ -198,7 +203,7 @@ else
     override CFLAGS += -D_FORTIFY_SOURCE=2
 endif
 
-OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ)
+OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_ops$(OBJ)
 
 SRCS = $(OBJS:$(OBJ)=.c)
 
@@ -250,7 +255,7 @@ $(OUT_DIR)/$(OUTLIBV): | clean_libcmp_a
 $(OUT_DIR)/$(OUTLIBV): $(OUT_DIR)/$(LIBCMP_A)
    endif
 endif
-$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ)
+$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_ops$(OBJ)
 	$(CC) $^ $(LDFLAGS) $(LIBS) -shared -o $@ -Wl,-$(SONAME)$(OUTLIBV)
 
 $(OUT_DIR)/$(OUTLIB): $(OUT_DIR)/$(OUTLIBV)
