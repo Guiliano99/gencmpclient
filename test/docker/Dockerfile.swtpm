@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+#
+# Smoke-test image: build src/tpm_ops.c and run it against a swtpm software TPM.
+#
+# Build (from the repo root, so the COPY paths resolve):
+#   docker build -f test/docker/Dockerfile.swtpm -t tpm-ops-smoke:swtpm .
+# Run:
+#   docker run --rm tpm-ops-smoke:swtpm
+#
+# Expects the repo's prebuilt libsecutils.so.2.0 at the context root (it is
+# checked out alongside the sources).
+FROM debian:13-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libc6-dev libssl-dev \
+        libtss2-dev libtss2-tcti-swtpm0t64 libtss2-tcti-mssim0t64 \
+        tpm2-tools swtpm swtpm-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/tpm-smoke
+COPY src/tpm_ops.c src/tpm_ops.h ./src/
+COPY test/tpm_ops_smoke.c ./test/
+COPY libsecutils.so.2.0 ./
+COPY libsecutils/src/libsecutils/include ./secutils-include/
+COPY test/docker/run_smoke.sh ./run_smoke.sh
+
+# Build the harness against tpm_ops.c, the repo's prebuilt libsecutils, system
+# OpenSSL, and the TSS2 ESYS stack.  -Wall -Wextra must stay clean.
+RUN gcc -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
+        -I ./src -I ./secutils-include \
+        ./test/tpm_ops_smoke.c ./src/tpm_ops.c \
+        -L. -l:libsecutils.so.2.0 -lcrypto \
+        -ltss2-esys -ltss2-tctildr -ltss2-mu -ltss2-rc \
+        -Wl,-rpath,/opt/tpm-smoke -o tpm_ops_smoke \
+    && chmod +x run_smoke.sh
+
+ENV SIM=swtpm PORT=2321 AK_HANDLE=0x81010002 BIN=/opt/tpm-smoke/tpm_ops_smoke
+ENTRYPOINT ["/opt/tpm-smoke/run_smoke.sh"]

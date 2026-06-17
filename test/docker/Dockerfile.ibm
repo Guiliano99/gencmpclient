@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1
+#
+# Smoke-test image: build src/tpm_ops.c and run it against the IBM reference
+# TPM 2.0 simulator (ibmswtpm2 / tpm_server).
+#
+# Build (from the repo root, so the COPY paths resolve):
+#   docker build -f test/docker/Dockerfile.ibm -t tpm-ops-smoke:ibm .
+# Run:
+#   docker run --rm tpm-ops-smoke:ibm
+#
+# Expects the repo's prebuilt libsecutils.so.2.0 at the context root.
+
+# ── stage 1: build the IBM simulator binary from source ─────────────────────
+# Built on bookworm (OpenSSL 3.0): ibmswtpm2 rev183 has a version guard in
+# BnToOsslMath.h that #errors on trixie's OpenSSL 3.5 ("Untested OpenSSL
+# version").  The resulting tpm_server links libcrypto.so.3 and runs fine on
+# the 13-slim runtime stage (libcrypto.so.3 / glibc are forward-compatible).
+FROM debian:12-slim AS ibmtpm
+ENV DEBIAN_FRONTEND=noninteractive
+ARG IBMTPM_REV=rev183-2024-08-02
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libssl-dev git ca-certificates \
+    && git clone https://git.code.sf.net/p/ibmswtpm2/tpm2 /tmp/ibmswtpm2 \
+    && git -C /tmp/ibmswtpm2 checkout --quiet "${IBMTPM_REV}" \
+    && make -C /tmp/ibmswtpm2/src -j"$(nproc)" \
+    && cp /tmp/ibmswtpm2/src/tpm_server /usr/local/bin/tpm_server
+
+# ── stage 2: runtime + harness ──────────────────────────────────────────────
+FROM debian:13-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libc6-dev libssl-dev \
+        libtss2-dev libtss2-tcti-mssim0t64 \
+        tpm2-tools \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ibmtpm /usr/local/bin/tpm_server /usr/local/bin/tpm_server
+
+WORKDIR /opt/tpm-smoke
+COPY src/tpm_ops.c src/tpm_ops.h ./src/
+COPY test/tpm_ops_smoke.c ./test/
+COPY libsecutils.so.2.0 ./
+COPY libsecutils/src/libsecutils/include ./secutils-include/
+COPY test/docker/run_smoke.sh ./run_smoke.sh
+
+RUN gcc -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
+        -I ./src -I ./secutils-include \
+        ./test/tpm_ops_smoke.c ./src/tpm_ops.c \
+        -L. -l:libsecutils.so.2.0 -lcrypto \
+        -ltss2-esys -ltss2-tctildr -ltss2-mu -ltss2-rc \
+        -Wl,-rpath,/opt/tpm-smoke -o tpm_ops_smoke \
+    && chmod +x run_smoke.sh
+
+ENV SIM=ibm PORT=2321 AK_HANDLE=0x81010002 BIN=/opt/tpm-smoke/tpm_ops_smoke
+ENTRYPOINT ["/opt/tpm-smoke/run_smoke.sh"]
