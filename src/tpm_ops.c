@@ -230,6 +230,32 @@ static int marshal_signature(const TPMT_SIGNATURE *sig,
     return 1;
 }
 
+/* Initialize the TCTI then ESYS, mirroring esys_teardown().  On success
+ * *tcti and *esys are set and the caller must release both with
+ * esys_teardown().  On failure both are left NULL (any partially-opened TCTI
+ * is finalized here) and the caller can simply return.  Returns 1/0. */
+static int esys_setup(const char *tcti_str,
+                      TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys)
+{
+    *tcti = NULL;
+    *esys = NULL;
+
+    TSS2_RC rc = Tss2_TctiLdr_Initialize(tcti_str, tcti);
+    if (rc != TSS2_RC_SUCCESS) {
+        LOG(FL_ERR, "tpm_ops: Tss2_TctiLdr_Initialize(%s) failed: %s",
+            tcti_str, Tss2_RC_Decode(rc));
+        return 0;
+    }
+
+    rc = Esys_Initialize(esys, *tcti, NULL);
+    if (rc != TSS2_RC_SUCCESS) {
+        LOG(FL_ERR, "tpm_ops: Esys_Initialize failed: %s", Tss2_RC_Decode(rc));
+        Tss2_TctiLdr_Finalize(tcti);
+        return 0;
+    }
+    return 1;
+}
+
 static void esys_teardown(ESYS_CONTEXT *esys, TSS2_TCTI_CONTEXT *tcti)
 {
     if (esys != NULL)
@@ -287,27 +313,14 @@ int tpm_certify_key_from_pem(const char *tcti_str,
 
     /* 2. Initialize TCTI + ESYS. */
     TSS2_TCTI_CONTEXT *tcti = NULL;
-    TSS2_RC rc = Tss2_TctiLdr_Initialize(tcti_str, &tcti);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG(FL_ERR, "tpm_ops: Tss2_TctiLdr_Initialize(%s) failed: %s",
-            tcti_str, Tss2_RC_Decode(rc));
-        return 0;
-    }
-
     ESYS_CONTEXT *esys = NULL;
-    rc = Esys_Initialize(&esys, tcti, NULL);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG(FL_ERR, "tpm_ops: Esys_Initialize failed: %s", Tss2_RC_Decode(rc));
-        Tss2_TctiLdr_Finalize(&tcti);
+    if (!esys_setup(tcti_str, &tcti, &esys))
         return 0;
-    }
+    TSS2_RC rc;
 
     ESYS_TR parent_tr = ESYS_TR_NONE;
     ESYS_TR ak_tr     = ESYS_TR_NONE;
     ESYS_TR subject_tr = ESYS_TR_NONE;
-    TPM2B_PUBLIC  *subject_pub_out = NULL;
-    TPM2B_NAME    *subject_name_out = NULL;
-    TPM2B_NAME    *subject_qn_out   = NULL;
     TPM2B_ATTEST  *attest_out_b = NULL;
     TPMT_SIGNATURE *sig_out_s   = NULL;
 
@@ -390,9 +403,6 @@ done:
     if (subject_tr != ESYS_TR_NONE)
         (void)Esys_FlushContext(esys, subject_tr);
 
-    Esys_Free(subject_pub_out);
-    Esys_Free(subject_name_out);
-    Esys_Free(subject_qn_out);
     Esys_Free(attest_out_b);
     Esys_Free(sig_out_s);
 
@@ -513,20 +523,10 @@ int tpm_quote_pcrs(const char *tcti_str,
     int ok = 0;
 
     TSS2_TCTI_CONTEXT *tcti = NULL;
-    TSS2_RC rc = Tss2_TctiLdr_Initialize(tcti_str, &tcti);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG(FL_ERR, "tpm_ops: Tss2_TctiLdr_Initialize(%s) failed: %s",
-            tcti_str, Tss2_RC_Decode(rc));
-        return 0;
-    }
-
     ESYS_CONTEXT *esys = NULL;
-    rc = Esys_Initialize(&esys, tcti, NULL);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG(FL_ERR, "tpm_ops: Esys_Initialize failed: %s", Tss2_RC_Decode(rc));
-        Tss2_TctiLdr_Finalize(&tcti);
+    if (!esys_setup(tcti_str, &tcti, &esys))
         return 0;
-    }
+    TSS2_RC rc;
 
     ESYS_TR ak_tr = ESYS_TR_NONE;
     TPM2B_ATTEST  *attest_b = NULL;
@@ -678,20 +678,10 @@ int tpm_rsa_oaep_decrypt(const char *tcti_str,
 
     /* 2. Initialize TCTI + ESYS. */
     TSS2_TCTI_CONTEXT *tcti = NULL;
-    TSS2_RC rc = Tss2_TctiLdr_Initialize(tcti_str, &tcti);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG(FL_ERR, "tpm_ops: Tss2_TctiLdr_Initialize(%s) failed: %s",
-            tcti_str, Tss2_RC_Decode(rc));
-        return 0;
-    }
-
     ESYS_CONTEXT *esys = NULL;
-    rc = Esys_Initialize(&esys, tcti, NULL);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG(FL_ERR, "tpm_ops: Esys_Initialize failed: %s", Tss2_RC_Decode(rc));
-        Tss2_TctiLdr_Finalize(&tcti);
+    if (!esys_setup(tcti_str, &tcti, &esys))
         return 0;
-    }
+    TSS2_RC rc;
 
     ESYS_TR parent_tr  = ESYS_TR_NONE;
     ESYS_TR subject_tr = ESYS_TR_NONE;
