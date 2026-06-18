@@ -659,6 +659,32 @@ static const char *get_tpm_pcr_selection_oid(void)
 }
 
 /*
+ * Build DER(TpmAttestationParams{hashAlgId=alg_id}) for the NonceRequest
+ * reqInfo.  The pcrs field is omitted (attester-proposal shape — the RA/CA
+ * selects the PCR set).  On success returns the DER length and sets *out
+ * (caller frees with OPENSSL_free); returns <= 0 on error.
+ *
+ * The TPM-specific encoding lives here in the client, not in OpenSSL: the CMP
+ * layer treats reqInfo as an opaque ASN.1 ANY and only carries these bytes.
+ */
+static int build_tpm_hash_proposal_der(unsigned int alg_id, unsigned char **out)
+{
+    LOCAL_TPM_ATTESTATION_PARAMS *tap = LOCAL_TPM_ATTESTATION_PARAMS_new();
+    int len = -1;
+
+    *out = NULL;
+    if (tap == NULL)
+        goto end;
+    if ((tap->hashAlgId = ASN1_INTEGER_new()) == NULL
+            || !ASN1_INTEGER_set(tap->hashAlgId, (long)alg_id))
+        goto end;
+    len = i2d_LOCAL_TPM_ATTESTATION_PARAMS(tap, out);
+ end:
+    LOCAL_TPM_ATTESTATION_PARAMS_free(tap);
+    return len;
+}
+
+/*
  * parse_tpm_attestation_params_der
  * ---------------------------------
  * Decode a TpmAttestationParams DER blob (SPEC §DR-11).
@@ -2108,10 +2134,20 @@ static int setup_ctx(CMP_CTX *ctx)
          * quote.  The RA/CA echoes the accepted value in
          * NonceResponse.respInfo (TpmAttestationParams). */
         if (opt_tpm_ak_handle_str != NULL) {
-            if (!OSSL_CMP_CTX_set_tpm_hash_alg_proposal(ctx, 0x000B)) {
+            unsigned char *tap_der = NULL;
+            int tap_len = build_tpm_hash_proposal_der(0x000B, &tap_der);
+
+            /* Hand OpenSSL an opaque (type OID, reqInfo DER) pair; the TPM
+             * payload encoding stays here in the client. */
+            if (tap_len <= 0
+                    || !OSSL_CMP_CTX_set1_rats_reqInfo(ctx,
+                                                       get_tpm_pcr_selection_oid(),
+                                                       tap_der, tap_len)) {
+                OPENSSL_free(tap_der);
                 LOG_err("Failed to set TPM hash algorithm proposal in CMP context");
                 goto err;
             }
+            OPENSSL_free(tap_der);
             LOG(FL_INFO, "Configured TPM hash algorithm proposal: 0x000B (SHA-256)");
         }
     }
