@@ -345,13 +345,13 @@ opt_t cmp_opts[] = {
     { "pcr_values", OPT_TXT, {.txt = NULL}, { &opt_pcr_values },
       "File containing PCR values binary (TcgAttestQuote, platform attestation)"},
     { "tpm_attest_type", OPT_TXT, {.txt = "certify"}, { &opt_tpm_attest_type },
-      "TPM attestation statement type for the FILE-BASED path: \"certify\""},
-    OPT_MORE("(TcgAttestCertify, OID 2.23.133.20.1, default) or \"quote\" (OID 2.23.133.20.2)."),
-    OPT_MORE("INERT with -tpm_ak_handle: the native path always emits TcgAttestQuote."),
+      "TPM attestation statement type: \"certify\" (TcgAttestCertify, OID"},
+    OPT_MORE("2.23.133.20.1, default) or \"quote\" (TcgAttestQuote, OID 2.23.133.20.2)."),
+    OPT_MORE("Honoured by BOTH the native (-tpm_ak_handle) and file-based paths;"),
+    OPT_MORE("native \"certify\" requires -tpm_subject_pem (the subject key blob)."),
     { "tpm_certify_oid", OPT_TXT, {.txt = NULL}, { &opt_tpm_certify_oid },
-      "Override the AttestationStatement type OID (FILE-BASED path only)."},
+      "Override the AttestationStatement type OID (native and file-based paths)."},
     OPT_MORE("Default: 2.23.133.20.1 (certify) or 2.23.133.20.2 (quote) based on -tpm_attest_type."),
-    OPT_MORE("INERT with -tpm_ak_handle (native path is fixed to TcgAttestQuote)."),
     { "tpm_ak_handle", OPT_TXT, {.txt = NULL}, { &opt_tpm_ak_handle_str },
       "Persistent TPM handle of the AK (e.g. 0x81010002).  When set, gencmpclient"},
     OPT_MORE("drives Esys_Certify in-process using the AK at this handle and the"),
@@ -364,9 +364,9 @@ opt_t cmp_opts[] = {
       "AK X.509 certificate (PEM) to embed in AttestationBundle.certs.  Required by the"},
     OPT_MORE("verifier to validate the AK signature on TPMS_ATTEST against the trusted CA."),
     { "tpm_subject_pem", OPT_TXT, {.txt = NULL}, { &opt_tpm_subject_pem },
-      "TSS2 PRIVATE KEY PEM for the subject (key being certified).  Accepted for"},
-    OPT_MORE("CLI compatibility; UNUSED in the platform-only profile (reserved for the"),
-    OPT_MORE("key-attestation cycle).  Use -newkey <plain-public-pem> for the CertReqMsg."),
+      "TSS2 PRIVATE KEY PEM for the subject (key being certified).  REQUIRED by the"},
+    OPT_MORE("native path when -tpm_attest_type=certify: Esys_Load + Esys_Certify run"),
+    OPT_MORE("over it.  Use -newkey <plain-public-pem> for the CertReqMsg itself."),
     { "tpm_subject_pub_der", OPT_TXT, {.txt = NULL}, { &opt_tpm_subject_pub_der },
       "Path to a DER-encoded SubjectPublicKeyInfo of the to-be-attested key."},
     OPT_MORE("Accepted for CLI compatibility; UNUSED in the platform-only profile"),
@@ -656,6 +656,19 @@ static const char *get_tpm_pcr_selection_oid(void)
     const char *env = getenv("TPM_PCR_SELECTION_OID");
     return (env != NULL && env[0] != '\0')
            ? env : TPM_PCR_SELECTION_OID_DEFAULT;
+}
+
+/* NonceRequest request-type OID for the certify (key-attestation) profile.
+ * The RA/CA maps this OID to the TcgAttestCertify statement (2.23.133.20.1) and
+ * stores the nonce under it, so the certify evidence submitted later finds its
+ * nonce.  Must match the MockCA's TPM_KEY_ATTEST_OID. */
+#define TPM_KEY_ATTEST_OID_DEFAULT "1.3.6.1.4.1.99999.4"
+
+static const char *get_tpm_key_attest_oid(void)
+{
+    const char *env = getenv("TPM_KEY_ATTEST_OID");
+    return (env != NULL && env[0] != '\0')
+           ? env : TPM_KEY_ATTEST_OID_DEFAULT;
 }
 
 /*
@@ -1281,6 +1294,214 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
     return exts;
 }
 
+/*
+ * getTPMAttestExtNativeCertify - drive TPM2_Certify in-process and build the
+ * id-aa-attestation CSR extension (key attestation).
+ *
+ * The certify counterpart of getTPMAttestExtNative(): the AK at |ak_handle|
+ * certifies the TPM-resident subject key loaded from |subject_pem_path| (a
+ * TSS2_PRIVATE_KEY PEM), using the single RATS nonce from |ctx| as
+ * TPM2_Certify.qualifyingData.  Emits a TcgAttestCertify SEQUENCE
+ * (OID 2.23.133.20.1) carrying the TPMS_ATTEST, the AK signature, and the
+ * certified key's TPMT_PUBLIC — so the verifier can check
+ * TPMS_CERTIFY_INFO.name == H(TPMT_PUBLIC) (the G1 key-binding check) — wrapped
+ * in an AttestationBundle / id-aa-attestation extension.  When |ak_cert_pem_path|
+ * is non-NULL the AK cert is added to AttestationBundle.certs.
+ *
+ * Negative-test hook |corrupt_signature| mirrors getTPMAttestExtNative(): XOR
+ * byte 6 of the TPMT_SIGNATURE so the verifier's AK signature check rejects.
+ *
+ * Returns a newly-allocated X509_EXTENSIONS * on success, NULL on failure.
+ * Caller must free with sk_X509_EXTENSION_pop_free(..., X509_EXTENSION_free).
+ */
+static X509_EXTENSIONS *getTPMAttestExtNativeCertify(OSSL_CMP_CTX *ctx,
+                                                     const char *tcti_str,
+                                                     uint32_t ak_handle,
+                                                     const char *subject_pem_path,
+                                                     const char *ak_cert_pem_path,
+                                                     int corrupt_signature)
+{
+    X509_EXTENSIONS *exts = NULL;
+    X509_EXTENSION  *ext_evidence = NULL;
+    unsigned char   *attest_buf = NULL, *sig_buf = NULL, *tpmt_public_buf = NULL;
+    size_t           attest_len = 0,     sig_len = 0,     tpmt_public_len = 0;
+    unsigned char   *stmt_der = NULL, *bundle_der = NULL;
+    int              stmt_der_len = 0, bundle_der_len = 0;
+    int              ret = 0, att_nid;
+    const char      *type_oid_str;
+    LOCAL_ATT_STMT  *stmt = NULL;
+    LOCAL_ATT_BUNDLE *bundle = NULL;
+    X509            *ak_cert = NULL;
+    BIO             *cert_bio = NULL;
+    ASN1_OCTET_STRING oct;
+
+    if (subject_pem_path == NULL) {
+        LOG_err("getTPMAttestExtNativeCertify: -tpm_subject_pem is required for "
+                "TPM2_Certify (TSS2 PRIVATE KEY blob of the subject key)");
+        return NULL;
+    }
+
+    /* ── 1. Pull the RATS nonce from the CTX (TPM2_Certify.qualifyingData) ─── */
+    const ASN1_OCTET_STRING *nonce_os = OSSL_CMP_CTX_get0_rats_nonce(ctx);
+    const unsigned char *nonce;
+    size_t nonce_len;
+
+    if (nonce_os == NULL) {
+        LOG_err("getTPMAttestExtNativeCertify: no RATS nonce on CTX (was -rats "
+                "set and did GenM/GenP succeed?)");
+        return NULL;
+    }
+    nonce     = ASN1_STRING_get0_data(nonce_os);
+    nonce_len = (size_t)ASN1_STRING_length(nonce_os);
+    if (nonce_len == 0) {
+        LOG_err("getTPMAttestExtNativeCertify: RA/CA returned a zero-length "
+                "nonce — the key-attestation profile requires a nonce; aborting");
+        return NULL;
+    }
+    LOG(FL_INFO, "getTPMAttestExtNativeCertify: RATS nonce on CTX (%zuB) — used "
+                 "as TPM2_Certify.qualifyingData", nonce_len);
+
+    /* ── 2. Drive TPM2_Certify in-process ─────────────────────────────────── */
+    if (!tpm_certify_key_from_pem(tcti_str, ak_handle, subject_pem_path,
+                                  nonce, nonce_len,
+                                  &attest_buf, &attest_len,
+                                  &sig_buf, &sig_len,
+                                  &tpmt_public_buf, &tpmt_public_len)) {
+        LOG_err("getTPMAttestExtNativeCertify: tpm_certify_key_from_pem failed");
+        goto err;
+    }
+    LOG(FL_INFO, "getTPMAttestExtNativeCertify: TPM2_Certify produced %zu-byte "
+                 "TPMS_ATTEST, %zu-byte TPMT_SIGNATURE, %zu-byte TPMT_PUBLIC",
+        attest_len, sig_len, tpmt_public_len);
+
+    /* Negative-test hook: corrupt the AK signature over TPMS_ATTEST (G5). */
+    if (corrupt_signature && sig_len > 6) {
+        sig_buf[6] ^= 0x01;
+        LOG_warn("getTPMAttestExtNativeCertify: -bad_attest_sig set — corrupted "
+                 "byte 6 of TPMT_SIGNATURE; verifier should reject");
+    }
+
+    /* ── 3. Build TcgAttestCertify { tpmSAttest, signature, tpmTPublic } ───── */
+    type_oid_str = (opt_tpm_certify_oid != NULL) ? opt_tpm_certify_oid
+                                                 : TCG_ATTEST_CERTIFY_OID;
+    {
+        TCG_ATTEST_CERTIFY *c = TCG_ATTEST_CERTIFY_new();
+        if (c == NULL) goto err;
+        if (!ASN1_OCTET_STRING_set(c->tpmSAttest, attest_buf, (int)attest_len)
+                || !ASN1_OCTET_STRING_set(c->signature, sig_buf, (int)sig_len)) {
+            TCG_ATTEST_CERTIFY_free(c);
+            goto err;
+        }
+        if (tpmt_public_buf != NULL && tpmt_public_len > 0) {
+            c->tpmTPublic = ASN1_OCTET_STRING_new();
+            if (c->tpmTPublic == NULL
+                    || !ASN1_OCTET_STRING_set(c->tpmTPublic, tpmt_public_buf,
+                                              (int)tpmt_public_len)) {
+                TCG_ATTEST_CERTIFY_free(c);
+                goto err;
+            }
+        }
+        stmt_der_len = i2d_TCG_ATTEST_CERTIFY(c, &stmt_der);
+        TCG_ATTEST_CERTIFY_free(c);
+        if (stmt_der_len <= 0) {
+            LOG_err("getTPMAttestExtNativeCertify: i2d_TCG_ATTEST_CERTIFY failed");
+            goto err;
+        }
+    }
+
+    /* ── AttestationStatement { type OID, stmt ANY } ──────────────────────── */
+    stmt = LOCAL_ATT_STMT_new();
+    if (stmt == NULL) goto err;
+    ASN1_OBJECT_free(stmt->type);
+    stmt->type = OBJ_txt2obj(type_oid_str, 1);
+    if (stmt->type == NULL) goto err;
+    LOG(FL_INFO, "getTPMAttestExtNativeCertify: certify AttestationStatement "
+                 "OID: %s", type_oid_str);
+    {
+        ASN1_STRING *der_str = ASN1_STRING_new();
+        if (der_str == NULL) goto err;
+        if (!ASN1_STRING_set(der_str, stmt_der, stmt_der_len)) {
+            ASN1_STRING_free(der_str);
+            goto err;
+        }
+        ASN1_TYPE_set(stmt->stmt, V_ASN1_SEQUENCE, der_str);
+    }
+
+    /* ── 4. Build AttestationBundle { attestations, certs? } ──────────────── */
+    bundle = LOCAL_ATT_BUNDLE_new();
+    if (bundle == NULL) goto err;
+    if (bundle->attestations == NULL
+            && (bundle->attestations = sk_LOCAL_ATT_STMT_new_null()) == NULL)
+        goto err;
+    if (!sk_LOCAL_ATT_STMT_push(bundle->attestations, stmt)) goto err;
+    stmt = NULL; /* ownership transferred */
+
+    if (ak_cert_pem_path != NULL) {
+        cert_bio = BIO_new_file(ak_cert_pem_path, "r");
+        if (cert_bio == NULL) {
+            LOG(FL_ERR, "getTPMAttestExtNativeCertify: cannot open AK cert %s",
+                ak_cert_pem_path);
+            goto err;
+        }
+        ak_cert = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL);
+        if (ak_cert == NULL) {
+            LOG(FL_ERR, "getTPMAttestExtNativeCertify: PEM_read_bio_X509 failed "
+                "for %s", ak_cert_pem_path);
+            goto err;
+        }
+        if (bundle->certs == NULL
+                && (bundle->certs = sk_X509_new_null()) == NULL)
+            goto err;
+        if (!sk_X509_push(bundle->certs, ak_cert))
+            goto err;
+        ak_cert = NULL; /* ownership transferred to bundle */
+    }
+
+    bundle_der_len = i2d_LOCAL_ATT_BUNDLE(bundle, &bundle_der);
+    if (bundle_der_len < 0) goto err;
+
+    /* ── 5. Wrap the bundle as id-aa-attestation X.509 extension ─────────── */
+    oct.data   = bundle_der;
+    oct.length = bundle_der_len;
+    oct.flags  = 0;
+    att_nid = OBJ_txt2nid(ID_AA_ATTESTATION_OID);
+    if (att_nid == NID_undef)
+        att_nid = OBJ_create(ID_AA_ATTESTATION_OID,
+                             "id-aa-attestation", "id-aa-attestation");
+    if (att_nid == NID_undef) {
+        LOG_err("getTPMAttestExtNativeCertify: OBJ_create(id-aa-attestation) failed");
+        goto err;
+    }
+    ext_evidence = X509_EXTENSION_create_by_NID(NULL, att_nid, 0, &oct);
+    if (ext_evidence == NULL
+            || (exts = sk_X509_EXTENSION_new_null()) == NULL
+            || !sk_X509_EXTENSION_push(exts, ext_evidence))
+        goto err;
+    ext_evidence = NULL; /* ownership transferred to exts */
+
+    ret = 1;
+    LOG(FL_INFO, "getTPMAttestExtNativeCertify: built bundle with "
+                 "TcgAttestCertify (%d bytes DER) as CSR extension "
+                 ID_AA_ATTESTATION_OID, bundle_der_len);
+
+ err:
+    OPENSSL_free(attest_buf);
+    OPENSSL_free(sig_buf);
+    OPENSSL_free(tpmt_public_buf);
+    OPENSSL_free(stmt_der);
+    OPENSSL_free(bundle_der);
+    LOCAL_ATT_STMT_free(stmt);
+    LOCAL_ATT_BUNDLE_free(bundle);
+    X509_free(ak_cert);
+    BIO_free(cert_bio);
+    if (ret == 0) {
+        X509_EXTENSION_free(ext_evidence);
+        sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+        exts = NULL;
+    }
+    return exts;
+}
+
 #ifdef USE_ATGLIB
 
 
@@ -1451,24 +1672,28 @@ static int add_rats_extensions(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config, X509_EX
             return 0;
         }
 
-        /* Platform-only profile: the subject key options and the KeyAttestPoP
-         * negative-test flags are accepted for CLI compatibility but unused. */
+        /* The KeyAttestPoP negative-test flags remain inert (the OAEP/PBMAC
+         * proof loop is not built in this profile). */
         if (opt_bad_pbmac || opt_bad_oaep)
-            LOG_warn("add_rats_extensions: -bad_pbmac/-bad_oaep are inert in "
-                     "the platform-only profile (KeyAttestPoP not built)");
-        if (opt_bad_tpmt_public)
-            LOG_warn("add_rats_extensions: -bad_tpmt_public is inert in the "
-                     "platform-only profile (TcgAttestCertify not built)");
-        if (opt_tpm_certify_oid != NULL
-                || (opt_tpm_attest_type != NULL
-                    && strcmp(opt_tpm_attest_type, "quote") != 0))
-            LOG_warn("add_rats_extensions: -tpm_certify_oid / -tpm_attest_type "
-                     "are inert with -tpm_ak_handle: the native path always "
-                     "emits TcgAttestQuote (OID 2.23.133.20.2)");
+            LOG_warn("add_rats_extensions: -bad_pbmac/-bad_oaep are inert "
+                     "(KeyAttestPoP not built)");
 
-        rats_exts = getTPMAttestExtNative(ctx, tcti, (uint32_t)ah,
-                                           opt_tpm_ak_cert,
-                                           opt_bad_attest_sig);
+        /* Route by attestation type: "certify" drives TPM2_Certify over the
+         * TPM-resident subject key (-tpm_subject_pem) and emits TcgAttestCertify
+         * (OID 2.23.133.20.1); anything else (default "quote") drives TPM2_Quote
+         * and emits TcgAttestQuote (OID 2.23.133.20.2).  Both run in-process via
+         * tpm_ops.c using the AK at -tpm_ak_handle. */
+        if (opt_tpm_attest_type != NULL
+                && strcmp(opt_tpm_attest_type, "certify") == 0) {
+            rats_exts = getTPMAttestExtNativeCertify(ctx, tcti, (uint32_t)ah,
+                                                     opt_tpm_subject_pem,
+                                                     opt_tpm_ak_cert,
+                                                     opt_bad_attest_sig);
+        } else {
+            rats_exts = getTPMAttestExtNative(ctx, tcti, (uint32_t)ah,
+                                              opt_tpm_ak_cert,
+                                              opt_bad_attest_sig);
+        }
     }
     /* TPM file-based path: build TcgAttestCertify/TcgAttestQuote from blobs. */
     else if (opt_tpms_attest != NULL) {
@@ -2126,29 +2351,37 @@ static int setup_ctx(CMP_CTX *ctx)
         }
         (void) OSSL_CMP_CTX_set_certreq_cb(ctx, CMPclient_app_cb);
         (void) OSSL_CMP_CTX_set_certreq_cb_arg(ctx, (void *)rats_config);
-        if (opt_tpm_subject_pem != NULL || opt_tpm_subject_pub_der != NULL)
-            LOG_warn("-tpm_subject_pem / -tpm_subject_pub_der are ignored: "
-                     "unused in the platform-only profile (reserved for the "
-                     "key-attestation cycle)");
-        /* Propose SHA-256 (0x000B) as the preferred hash for the platform
-         * quote.  The RA/CA echoes the accepted value in
-         * NonceResponse.respInfo (TpmAttestationParams). */
+        if (opt_tpm_subject_pub_der != NULL)
+            LOG_warn("-tpm_subject_pub_der is ignored (reserved; native certify "
+                     "uses -tpm_subject_pem)");
+        /* Propose SHA-256 (0x000B) as the preferred hash.  The RA/CA echoes the
+         * accepted value in NonceResponse.respInfo (TpmAttestationParams).  The
+         * NonceRequest request-type OID selects the attestation profile under
+         * which the RA/CA stores the nonce: TPM_KEY_ATTEST_OID for certify
+         * (→ TcgAttestCertify 2.23.133.20.1) or TPM_PCR_SELECTION_OID for the
+         * quote default (→ TcgAttestQuote 2.23.133.20.2). */
         if (opt_tpm_ak_handle_str != NULL) {
             unsigned char *tap_der = NULL;
             int tap_len = build_tpm_hash_proposal_der(0x000B, &tap_der);
+            const int is_certify = (opt_tpm_attest_type != NULL
+                                    && strcmp(opt_tpm_attest_type, "certify") == 0);
+            const char *reqinfo_oid = is_certify ? get_tpm_key_attest_oid()
+                                                 : get_tpm_pcr_selection_oid();
 
             /* Hand OpenSSL an opaque (type OID, reqInfo DER) pair; the TPM
-             * payload encoding stays here in the client. */
+             * payload encoding stays here in the client.  The reqInfo SEQUENCE
+             * is opaque to the CMP layer — certify ignores the PCR/hash
+             * negotiation but a valid TpmAttestationParams is harmless. */
             if (tap_len <= 0
-                    || !OSSL_CMP_CTX_set1_rats_reqInfo(ctx,
-                                                       get_tpm_pcr_selection_oid(),
+                    || !OSSL_CMP_CTX_set1_rats_reqInfo(ctx, reqinfo_oid,
                                                        tap_der, tap_len)) {
                 OPENSSL_free(tap_der);
-                LOG_err("Failed to set TPM hash algorithm proposal in CMP context");
+                LOG_err("Failed to set TPM NonceRequest reqInfo in CMP context");
                 goto err;
             }
             OPENSSL_free(tap_der);
-            LOG(FL_INFO, "Configured TPM hash algorithm proposal: 0x000B (SHA-256)");
+            LOG(FL_INFO, "Configured TPM NonceRequest: type=%s, hash proposal "
+                         "0x000B (SHA-256)", reqinfo_oid);
         }
     }
 
