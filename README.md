@@ -697,6 +697,21 @@ A large set of CLI-based tests using the Insta Demo CA may be invoked using
 make -f Makefile_v1 test_Insta
 ```
 
+### Demo/test use with the CMP test suite mock CA
+
+The mock CA of the [CMP test suite](https://github.com/siemens/cmp-test-suite)
+can be used as a local CMP server for demo and test purposes.
+The config file template [`config/test_suite.cnf`](config/test_suite.cnf)
+contains in its header comments full instructions on
+how to start the mock CA and how to run `cmpClient` against it, e.g.:
+
+```bash
+LD_LIBRARY_PATH=. ./cmpClient imprint -config config/test_suite.cnf -section mockCA
+```
+
+Conversely, the test suite's `client_tests/` harness can drive `cmpClient`
+as the client under test against the mock CA.
+
 ## Using the library in own applications
 
 For building the library (and optionally the CLI application)

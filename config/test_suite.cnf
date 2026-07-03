@@ -1,0 +1,55 @@
+# For full documentation of the options, see ../doc/cmpClient-cli.{pod,md}
+#
+# Configuration for running cmpClient against the mock CA of the
+# CMP test suite: https://github.com/siemens/cmp-test-suite
+#
+# Start the mock CA from the root directory of a cmp-test-suite checkout:
+#   pip install uv && uv sync
+#   uv run python mock_ca/ca_handler.py --allow-same-key
+# It then listens on http://127.0.0.1:5000 using the pre-shared secret 'SiemensIT'.
+# The --allow-same-key option permits repeated enrollment with the same key,
+# e.g., when re-running the pkcs10 use case below with the same CSR.
+#
+# Run cmpClient against it from the root directory of this repo, e.g.:
+#   make -f Makefile_v1 build USE_LIBCMP=1
+#   LD_LIBRARY_PATH=. ./cmpClient imprint -config config/test_suite.cnf -section mockCA
+#   LD_LIBRARY_PATH=. ./cmpClient pkcs10  -config config/test_suite.cnf -section mockCA
+#
+# Note: building with USE_LIBCMP=1 is recommended because the mock CA checks,
+# as specified in RFC 9483 section 3.1, that with MAC-based protection the
+# senderKID equals the commonName of the sender field. For the pkcs10 (p10cr)
+# use case this requires the RFC 9483 default for the senderKID provided by
+# the intermediate CMP library (cmpossl) but not by OpenSSL itself.
+
+[default]
+verbosity = 6
+msg_timeout = 10
+total_timeout = 30
+# accept error messages that the client cannot authenticate, to see their contents:
+unprotected_errors = 1
+
+[mockCA]
+server = http://127.0.0.1:5000/issuing
+tls_used = 0
+no_proxy = 127.0.0.1,localhost
+# MAC-based (PBM) protection using the mock CA's pre-shared secret:
+secret = pass:SiemensIT
+#mac = hmac-sha1 # (default)
+# with MAC-based protection the mock CA requires senderKID == sender CN:
+ref = cmp-test-client
+subject = /CN=cmp-test-client
+# name used by the mock CA as sender of its responses:
+recipient = "/CN=Mock CA"
+
+[imprint]
+cmd = ir
+# generate a fresh key on each invocation:
+newkeytype = RSA:2048 # for an EC key use, e.g., "EC:prime256v1"
+newkey = creds/new.pem
+newkeypass = pass:12345
+certout = creds/new.crt
+
+[pkcs10]
+cmd = p10cr
+csr = creds/test.csr.pem
+certout = creds/new.crt
