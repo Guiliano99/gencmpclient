@@ -711,8 +711,7 @@ CMP_err CMPclient_enroll(OSSL_CMP_CTX *ctx, CREDENTIALS **new_creds, int cmd)
                                              new_cert_truststore /* may NULL */,
                                              0, OSSL_CMP_CTX_get0_libctx(ctx),
                                              OSSL_CMP_CTX_get0_propq(ctx));
-    if (sk_X509_num(chain) > 0)
-        X509_free(sk_X509_shift(chain)); /* remove leaf (EE) cert */
+    /* not removing the newly enrolled (typically leaf/EE) cert */
     if (new_cert_truststore != NULL) {
         if (chain == NULL) {
             LOG_err("Failed building chain for newly enrolled cert");
@@ -720,8 +719,8 @@ CMP_err CMPclient_enroll(OSSL_CMP_CTX *ctx, CREDENTIALS **new_creds, int cmd)
         }
         LOG_debug("Succeeded building proper chain for newly enrolled cert");
     } else if (chain == NULL) {
-        LOG_warn("Could not build approximate chain for newly enrolled cert, resorting to received extraCerts");
-        chain = OSSL_CMP_CTX_get1_extraCertsIn(ctx);
+        LOG_err("Error building approximate chain for newly enrolled cert");
+        goto err;
     } else {
         LOG_debug("Succeeded building approximate chain for newly enrolled cert");
     }
