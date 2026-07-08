@@ -542,7 +542,7 @@ int tpm_quote_pcrs(const char *tcti_str,
     }
 
     /* PCR selection: SHA-256 bank, indices supplied by the verifier
-     * (NonceResponse.respInfo TpmAttestationParams — SPEC §DR-11).
+     * (NonceResponse.respInfo TPM20QuoteRespInfo).
      * pcrSelect is a little-endian bitmap by byte:
      *   byte 0 bits 0..7 → PCRs 0..7
      *   byte 1 bits 0..7 → PCRs 8..15

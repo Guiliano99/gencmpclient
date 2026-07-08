@@ -79,7 +79,7 @@ int tpm_certify_key_from_pem(const char *tcti_str,
  *
  * |pcr_indices| / |pcr_count| describe the SHA-256 PCR set to quote.  Only
  * SHA-256 is supported in the current scope: the hash-algorithm negotiation
- * carried in TpmAttestationParams.hashAlgId must therefore converge on
+ * carried in TPM20QuoteRespInfo.hashAlgo must therefore converge on
  * 0x000B (TPM2_ALG_SHA256) — callers should reject any verifier response
  * that picks a different value rather than silently quoting SHA-256.
  * Each index must be in 0..23 (PCR registers).  Pass NULL / 0 to fall back
