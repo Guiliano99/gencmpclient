@@ -609,7 +609,7 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
  * test binary can link against them without duplicating the struct layout.
  */
 #include "rats_csr_asn.h"
-#include "tpm_ops.h"
+#include "tpm_py_bridge.h"
 
 /*
  * OID: id-aa-attestation = 1.2.840.113549.1.9.16.2.59
@@ -1062,12 +1062,11 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
 {
     X509_EXTENSIONS *exts = NULL;
     X509_EXTENSION  *ext_evidence  = NULL;
-    unsigned char   *quote_attest_buf = NULL, *quote_sig_buf = NULL;
-    size_t           quote_attest_len = 0,     quote_sig_len = 0;
-    unsigned char   *quote_pcr_vals_buf = NULL;
-    size_t           quote_pcr_vals_len = 0;
-    unsigned char   *quote_stmt_der = NULL, *bundle_der = NULL;
-    int              quote_stmt_der_len = 0, bundle_der_len = 0;
+    unsigned char   *evidence_der = NULL;
+    size_t           evidence_der_len = 0;
+    char            *type_oid = NULL;
+    unsigned char   *bundle_der = NULL;
+    int              bundle_der_len = 0;
     int              ret = 0, att_nid;
     LOCAL_ATT_STMT  *quote_stmt = NULL;
     LOCAL_ATT_BUNDLE *bundle = NULL;
@@ -1102,7 +1101,8 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
     LOG(FL_INFO, "getTPMAttestExtNative: RATS nonce on CTX (%zuB) — used as "
                  "TPM2_Quote.qualifyingData", quote_nonce_len);
 
-    /* ── 2. Drive TPM2_Quote in-process and build TcgAttestQuote SEQUENCE ── */
+    /* ── 2. Drive TPM2_Quote via libattest-py; wrap the returned opaque
+     *      evidence DER as the AttestationStatement.stmt ANY value ──────── */
     {
         unsigned int verifier_pcrs[24];
         size_t verifier_pcr_count = 0;
@@ -1146,69 +1146,27 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
                          "PCRs 0..4");
         }
 
-        if (!tpm_quote_pcrs(tcti_str, ak_handle,
-                            quote_nonce, quote_nonce_len,
-                            pcr_arg, pcr_arg_count,
-                            &quote_attest_buf, &quote_attest_len,
-                            &quote_sig_buf, &quote_sig_len,
-                            &quote_pcr_vals_buf, &quote_pcr_vals_len)) {
-            LOG_err("getTPMAttestExtNative: tpm_quote_pcrs failed");
+        if (!tpm2_quote_generate_evidence(tcti_str, ak_handle,
+                                          quote_nonce, quote_nonce_len,
+                                          pcr_arg, pcr_arg_count,
+                                          corrupt_signature,
+                                          &evidence_der, &evidence_der_len,
+                                          &type_oid)) {
+            LOG_err("getTPMAttestExtNative: tpm2_quote_generate_evidence failed");
             goto err;
         }
-        LOG(FL_INFO, "getTPMAttestExtNative: TPM2_Quote produced %zu-byte "
-                     "TPMS_ATTEST, %zu-byte TPMT_SIGNATURE",
-            quote_attest_len, quote_sig_len);
-
-        /* Negative-test hook: corrupt the AK signature over TPMS_ATTEST so
-         * the verifier's signature check rejects (G5). */
-        if (corrupt_signature && quote_sig_len > 6) {
-            quote_sig_buf[6] ^= 0x01;
-            LOG_warn("getTPMAttestExtNative: -bad_attest_sig set — corrupted "
-                     "byte 6 of TPMT_SIGNATURE; verifier should reject");
-        }
-
-        TCG_ATTEST_QUOTE *q = TCG_ATTEST_QUOTE_new();
-        if (q == NULL) goto err;
-        if (!ASN1_OCTET_STRING_set(q->tpmSAttest, quote_attest_buf, (int)quote_attest_len)
-                || !ASN1_OCTET_STRING_set(q->signature, quote_sig_buf, (int)quote_sig_len)) {
-            TCG_ATTEST_QUOTE_free(q);
-            goto err;
-        }
-        /* pcrValues — carry the raw per-PCR values so the verifier can
-         * recompute pcrDigest = H(values), bind them to the AK-signed quote
-         * (G_PCR_VALUES_BIND), and surface them in the issued certificate's
-         * TPM EAT.  The verifier still appraises the signed pcrDigest against
-         * PCR_REFERENCE_VALUES_FILE; these values are the bound, attested
-         * detail behind that digest. */
-        if (quote_pcr_vals_buf != NULL && quote_pcr_vals_len > 0) {
-            q->pcrValues = ASN1_OCTET_STRING_new();
-            if (q->pcrValues == NULL
-                    || !ASN1_OCTET_STRING_set(q->pcrValues, quote_pcr_vals_buf,
-                                              (int)quote_pcr_vals_len)) {
-                TCG_ATTEST_QUOTE_free(q);
-                goto err;
-            }
-            LOG(FL_INFO, "getTPMAttestExtNative: attached %zu-byte pcrValues to "
-                         "TcgAttestQuote", quote_pcr_vals_len);
-        }
-        quote_stmt_der_len = i2d_TCG_ATTEST_QUOTE(q, &quote_stmt_der);
-        TCG_ATTEST_QUOTE_free(q);
-        if (quote_stmt_der_len <= 0) {
-            LOG_err("getTPMAttestExtNative: i2d_TCG_ATTEST_QUOTE failed");
-            goto err;
-        }
+        LOG(FL_INFO, "getTPMAttestExtNative: TPM2_Quote evidence: %zu-byte DER, "
+                     "type OID %s", evidence_der_len, type_oid);
 
         quote_stmt = LOCAL_ATT_STMT_new();
         if (quote_stmt == NULL) goto err;
         ASN1_OBJECT_free(quote_stmt->type);
-        quote_stmt->type = OBJ_txt2obj(TCG_ATTEST_QUOTE_OID, 1);
+        quote_stmt->type = OBJ_txt2obj(type_oid, 1);
         if (quote_stmt->type == NULL) goto err;
-        LOG(FL_INFO, "getTPMAttestExtNative: quote AttestationStatement OID: %s",
-            TCG_ATTEST_QUOTE_OID);
         {
             ASN1_STRING *der_str = ASN1_STRING_new();
             if (der_str == NULL) goto err;
-            if (!ASN1_STRING_set(der_str, quote_stmt_der, quote_stmt_der_len)) {
+            if (!ASN1_STRING_set(der_str, evidence_der, (int)evidence_der_len)) {
                 ASN1_STRING_free(der_str);
                 goto err;
             }
@@ -1277,10 +1235,8 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
         bundle_der_len);
 
  err:
-    OPENSSL_free(quote_attest_buf);
-    OPENSSL_free(quote_sig_buf);
-    OPENSSL_free(quote_pcr_vals_buf);
-    OPENSSL_free(quote_stmt_der);
+    OPENSSL_free(evidence_der);
+    OPENSSL_free(type_oid);
     OPENSSL_free(bundle_der);
     LOCAL_ATT_STMT_free(quote_stmt);
     LOCAL_ATT_BUNDLE_free(bundle);
@@ -1323,10 +1279,11 @@ static X509_EXTENSIONS *getTPMAttestExtNativeCertify(OSSL_CMP_CTX *ctx,
 {
     X509_EXTENSIONS *exts = NULL;
     X509_EXTENSION  *ext_evidence = NULL;
-    unsigned char   *attest_buf = NULL, *sig_buf = NULL, *tpmt_public_buf = NULL;
-    size_t           attest_len = 0,     sig_len = 0,     tpmt_public_len = 0;
-    unsigned char   *stmt_der = NULL, *bundle_der = NULL;
-    int              stmt_der_len = 0, bundle_der_len = 0;
+    unsigned char   *evidence_der = NULL;
+    size_t           evidence_der_len = 0;
+    char            *type_oid = NULL;
+    unsigned char   *bundle_der = NULL;
+    int              bundle_der_len = 0;
     int              ret = 0, att_nid;
     const char      *type_oid_str;
     LOCAL_ATT_STMT  *stmt = NULL;
@@ -1361,53 +1318,22 @@ static X509_EXTENSIONS *getTPMAttestExtNativeCertify(OSSL_CMP_CTX *ctx,
     LOG(FL_INFO, "getTPMAttestExtNativeCertify: RATS nonce on CTX (%zuB) — used "
                  "as TPM2_Certify.qualifyingData", nonce_len);
 
-    /* ── 2. Drive TPM2_Certify in-process ─────────────────────────────────── */
-    if (!tpm_certify_key_from_pem(tcti_str, ak_handle, subject_pem_path,
-                                  nonce, nonce_len,
-                                  &attest_buf, &attest_len,
-                                  &sig_buf, &sig_len,
-                                  &tpmt_public_buf, &tpmt_public_len)) {
-        LOG_err("getTPMAttestExtNativeCertify: tpm_certify_key_from_pem failed");
+    /* ── 2. Drive TPM2_Certify via libattest-py ───────────────────────────── */
+    if (!tpm2_key_attest_generate_evidence(tcti_str, ak_handle, subject_pem_path,
+                                           nonce, nonce_len,
+                                           corrupt_signature,
+                                           &evidence_der, &evidence_der_len,
+                                           &type_oid)) {
+        LOG_err("getTPMAttestExtNativeCertify: tpm2_key_attest_generate_evidence failed");
         goto err;
     }
-    LOG(FL_INFO, "getTPMAttestExtNativeCertify: TPM2_Certify produced %zu-byte "
-                 "TPMS_ATTEST, %zu-byte TPMT_SIGNATURE, %zu-byte TPMT_PUBLIC",
-        attest_len, sig_len, tpmt_public_len);
+    LOG(FL_INFO, "getTPMAttestExtNativeCertify: TPM2_Certify evidence: %zu-byte "
+                 "DER, type OID %s", evidence_der_len, type_oid);
 
-    /* Negative-test hook: corrupt the AK signature over TPMS_ATTEST (G5). */
-    if (corrupt_signature && sig_len > 6) {
-        sig_buf[6] ^= 0x01;
-        LOG_warn("getTPMAttestExtNativeCertify: -bad_attest_sig set — corrupted "
-                 "byte 6 of TPMT_SIGNATURE; verifier should reject");
-    }
-
-    /* ── 3. Build TcgAttestCertify { tpmSAttest, signature, tpmTPublic } ───── */
-    type_oid_str = (opt_tpm_certify_oid != NULL) ? opt_tpm_certify_oid
-                                                 : TCG_ATTEST_CERTIFY_OID;
-    {
-        TCG_ATTEST_CERTIFY *c = TCG_ATTEST_CERTIFY_new();
-        if (c == NULL) goto err;
-        if (!ASN1_OCTET_STRING_set(c->tpmSAttest, attest_buf, (int)attest_len)
-                || !ASN1_OCTET_STRING_set(c->signature, sig_buf, (int)sig_len)) {
-            TCG_ATTEST_CERTIFY_free(c);
-            goto err;
-        }
-        if (tpmt_public_buf != NULL && tpmt_public_len > 0) {
-            c->tpmTPublic = ASN1_OCTET_STRING_new();
-            if (c->tpmTPublic == NULL
-                    || !ASN1_OCTET_STRING_set(c->tpmTPublic, tpmt_public_buf,
-                                              (int)tpmt_public_len)) {
-                TCG_ATTEST_CERTIFY_free(c);
-                goto err;
-            }
-        }
-        stmt_der_len = i2d_TCG_ATTEST_CERTIFY(c, &stmt_der);
-        TCG_ATTEST_CERTIFY_free(c);
-        if (stmt_der_len <= 0) {
-            LOG_err("getTPMAttestExtNativeCertify: i2d_TCG_ATTEST_CERTIFY failed");
-            goto err;
-        }
-    }
+    /* -tpm_certify_oid lets a (negative) test submit a client-chosen OID the
+     * verifier's allowlist should reject; it overrides libattest-py's OID
+     * only for the AttestationStatement's type label, not the DER contents. */
+    type_oid_str = (opt_tpm_certify_oid != NULL) ? opt_tpm_certify_oid : type_oid;
 
     /* ── AttestationStatement { type OID, stmt ANY } ──────────────────────── */
     stmt = LOCAL_ATT_STMT_new();
@@ -1420,7 +1346,7 @@ static X509_EXTENSIONS *getTPMAttestExtNativeCertify(OSSL_CMP_CTX *ctx,
     {
         ASN1_STRING *der_str = ASN1_STRING_new();
         if (der_str == NULL) goto err;
-        if (!ASN1_STRING_set(der_str, stmt_der, stmt_der_len)) {
+        if (!ASN1_STRING_set(der_str, evidence_der, (int)evidence_der_len)) {
             ASN1_STRING_free(der_str);
             goto err;
         }
@@ -1485,10 +1411,8 @@ static X509_EXTENSIONS *getTPMAttestExtNativeCertify(OSSL_CMP_CTX *ctx,
                  ID_AA_ATTESTATION_OID, bundle_der_len);
 
  err:
-    OPENSSL_free(attest_buf);
-    OPENSSL_free(sig_buf);
-    OPENSSL_free(tpmt_public_buf);
-    OPENSSL_free(stmt_der);
+    OPENSSL_free(evidence_der);
+    OPENSSL_free(type_oid);
     OPENSSL_free(bundle_der);
     LOCAL_ATT_STMT_free(stmt);
     LOCAL_ATT_BUNDLE_free(bundle);

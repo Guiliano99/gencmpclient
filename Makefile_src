@@ -138,10 +138,14 @@ ifdef SECUTILS_USE_UTA
     override LIBS += -luta
 endif
 
-# TPM 2.0 direct-access libraries for src/tpm_ops.c.  Used for in-process
-# Esys_Certify calls that cannot go through the tpm2-openssl provider (which
-# does not expose Certify/Quote).  See src/tpm_ops.h for the contract.
-override LIBS += -ltss2-esys -ltss2-tctildr -ltss2-mu -ltss2-rc
+# Embedded Python for src/tpm_py_bridge.c: TPM evidence generation
+# (TPM2_Quote / TPM2_Certify + the TcgAttestQuote/TcgAttestCertify ASN.1) now
+# runs entirely in libattest-py via this embedded interpreter, so the direct
+# TSS2 ESYS linkage tpm_ops.c used to need is gone. See src/tpm_py_bridge.h
+# for the contract; the embedded interpreter needs libattest-py importable
+# (site-packages or PYTHONPATH — see the attester Dockerfiles).
+override CFLAGS += $(shell python3-config --includes)
+override LIBS += $(shell python3-config --ldflags --embed)
 
 override LDFLAGS += $(DEBUG_FLAGS) # needed for -fsanitize=...
 ifeq ($(LPATH),)
@@ -203,7 +207,7 @@ else
     override CFLAGS += -D_FORTIFY_SOURCE=2
 endif
 
-OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_ops$(OBJ)
+OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ)
 
 SRCS = $(OBJS:$(OBJ)=.c)
 
@@ -255,7 +259,7 @@ $(OUT_DIR)/$(OUTLIBV): | clean_libcmp_a
 $(OUT_DIR)/$(OUTLIBV): $(OUT_DIR)/$(LIBCMP_A)
    endif
 endif
-$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_ops$(OBJ)
+$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ)
 	$(CC) $^ $(LDFLAGS) $(LIBS) -shared -o $@ -Wl,-$(SONAME)$(OUTLIBV)
 
 $(OUT_DIR)/$(OUTLIB): $(OUT_DIR)/$(OUTLIBV)
