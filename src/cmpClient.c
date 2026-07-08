@@ -643,10 +643,10 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
 /*
  * TPM PCR-selection / quote-parameter type OID.
  *
- * Per the attestation-freshness draft (PR #26 shape), the RA/CA returns
- * NonceResponse{type=this OID, respInfo=DER(TpmAttestationParams)}.  The
+ * Per the attestation-freshness draft, the RA/CA returns
+ * NonceResponse{type=this OID, respInfo=DER(TPM20QuoteRespInfo)}.  The
  * attester checks the response type, decodes respInfo as
- * TpmAttestationParams, and quotes those PCRs using the negotiated hash
+ * TPM20QuoteRespInfo, and quotes those PCRs using the negotiated hash
  * algorithm.
  */
 #define TPM_PCR_SELECTION_OID_DEFAULT "1.3.6.1.4.1.99999.3"
@@ -672,57 +672,71 @@ static const char *get_tpm_key_attest_oid(void)
 }
 
 /*
- * Build DER(TpmAttestationParams{hashAlgId=alg_id}) for the NonceRequest
- * reqInfo.  The pcrs field is omitted (attester-proposal shape — the RA/CA
- * selects the PCR set).  On success returns the DER length and sets *out
- * (caller frees with OPENSSL_free); returns <= 0 on error.
- *
- * The TPM-specific encoding lives here in the client, not in OpenSSL: the CMP
- * layer treats reqInfo as an opaque ASN.1 ANY and only carries these bytes.
+ * Build DER(TPM20QuoteReqInfo{certificateName=["ak"], supportedHashAlgo=[alg_id]})
+ * for NonceRequest.reqInfo: fixed demo AK label + single proposed hash bank (the
+ * RA/CA selects the PCRs + bank).  Returns DER length and sets *out (caller frees
+ * with OPENSSL_free), <= 0 on error.  The CMP layer carries reqInfo as opaque ANY.
  */
-static int build_tpm_hash_proposal_der(unsigned int alg_id, unsigned char **out)
+static int build_tpm20_quote_req_info_der(unsigned int alg_id, unsigned char **out)
 {
-    LOCAL_TPM_ATTESTATION_PARAMS *tap = LOCAL_TPM_ATTESTATION_PARAMS_new();
+    TPM20_QUOTE_REQ_INFO *ri = TPM20_QUOTE_REQ_INFO_new();
+    ASN1_UTF8STRING *cn = NULL;
+    ASN1_INTEGER *ha = NULL;
     int len = -1;
 
     *out = NULL;
-    if (tap == NULL)
+    if (ri == NULL)
         goto end;
-    if ((tap->hashAlgId = ASN1_INTEGER_new()) == NULL
-            || !ASN1_INTEGER_set(tap->hashAlgId, (long)alg_id))
+
+    /* certificateName = [ "ak" ] — fixed demo AK label (single AK, no selection) */
+    if ((ri->certificateName = sk_ASN1_UTF8STRING_new_null()) == NULL
+            || (cn = ASN1_UTF8STRING_new()) == NULL
+            || !ASN1_STRING_set(cn, "ak", 2)
+            || !sk_ASN1_UTF8STRING_push(ri->certificateName, cn))
         goto end;
-    len = i2d_LOCAL_TPM_ATTESTATION_PARAMS(tap, out);
+    cn = NULL; /* ownership transferred to the stack */
+
+    /* supportedHashAlgo = [ alg_id ] — single proposed hash bank */
+    if ((ri->supportedHashAlgo = sk_ASN1_INTEGER_new_null()) == NULL
+            || (ha = ASN1_INTEGER_new()) == NULL
+            || !ASN1_INTEGER_set(ha, (long)alg_id)
+            || !sk_ASN1_INTEGER_push(ri->supportedHashAlgo, ha))
+        goto end;
+    ha = NULL; /* ownership transferred to the stack */
+
+    len = i2d_TPM20_QUOTE_REQ_INFO(ri, out);
  end:
-    LOCAL_TPM_ATTESTATION_PARAMS_free(tap);
+    ASN1_UTF8STRING_free(cn);
+    ASN1_INTEGER_free(ha);
+    TPM20_QUOTE_REQ_INFO_free(ri);
     return len;
 }
 
 /*
- * parse_tpm_attestation_params_der
- * ---------------------------------
- * Decode a TpmAttestationParams DER blob (SPEC §DR-11).
+ * parse_tpm20_quote_resp_info_der
+ * --------------------------------
+ * Decode a TPM20QuoteRespInfo DER blob (attestation-freshness draft):
  *
- *     TpmAttestationParams ::= SEQUENCE {
- *         pcrs       SEQUENCE OF INTEGER OPTIONAL,
- *         hashAlgId  INTEGER             OPTIONAL
+ *     TPM20QuoteRespInfo ::= SEQUENCE {
+ *         certificateName UTF8String         OPTIONAL,
+ *         pcrSelection    SEQUENCE OF PCRIndex,   -- MANDATORY
+ *         hashAlgo        TPMAlgId                -- MANDATORY
  *     }
  *
- * Fills *out_pcrs with the PCR indices (when pcrs is present) and
- * *out_hash_alg_id with the algorithm ID (when hashAlgId is present).
- * When a field is absent, the corresponding output is left at its
- * caller-provided default:
- *   - pcrs absent  → *out_count = 0 (caller uses default PCRs 0..4)
- *   - hashAlgId absent → *out_hash_alg_id unchanged (caller default = 0x000B)
- *
- * Returns 1 on success, 0 on DER parse failure.
+ * Fills *out_pcrs / *out_count from the mandatory pcrSelection (validated 0..23)
+ * and *out_hash_alg_id from the mandatory hashAlgo (validated 1..65535);
+ * certificateName is ignored (demo provisions a single AK).  Both fields are
+ * mandatory, so on success *out_count > 0.  Returns 1 on success, 0 on parse or
+ * range failure.
  */
-static int parse_tpm_attestation_params_der(const unsigned char *der, long der_len,
-                                            unsigned int *out_pcrs, size_t out_max,
-                                            size_t *out_count,
-                                            unsigned int *out_hash_alg_id)
+static int parse_tpm20_quote_resp_info_der(const unsigned char *der, long der_len,
+                                           unsigned int *out_pcrs, size_t out_max,
+                                           size_t *out_count,
+                                           unsigned int *out_hash_alg_id)
 {
     const unsigned char *p = der;
-    LOCAL_TPM_ATTESTATION_PARAMS *tap = NULL;
+    TPM20_QUOTE_RESP_INFO *ri = NULL;
+    long alg;
     int ret = 0;
     int i, n;
 
@@ -732,83 +746,69 @@ static int parse_tpm_attestation_params_der(const unsigned char *der, long der_l
 
     *out_count = 0; /* own the count: do not rely on the caller pre-zeroing it */
 
-    tap = d2i_LOCAL_TPM_ATTESTATION_PARAMS(NULL, &p, der_len);
-    if (tap == NULL) {
-        LOG_err("TpmAttestationParams: DER did not decode");
+    ri = d2i_TPM20_QUOTE_RESP_INFO(NULL, &p, der_len);
+    if (ri == NULL) {
+        LOG_err("TPM20QuoteRespInfo: DER did not decode");
         return 0;
     }
     if (p != der + der_len) {
-        LOG(FL_ERR, "TpmAttestationParams: trailing bytes after SEQUENCE "
+        LOG(FL_ERR, "TPM20QuoteRespInfo: trailing bytes after SEQUENCE "
                     "(consumed %ld of %ld)", (long)(p - der), der_len);
         goto done;
     }
 
-    /* pcrs field — OPTIONAL */
-    if (tap->pcrs != NULL) {
-        n = sk_ASN1_INTEGER_num(tap->pcrs);
-        if (n <= 0) {
-            LOG_err("TpmAttestationParams: pcrs present but empty");
+    /* pcrSelection — MANDATORY, non-empty */
+    n = sk_ASN1_INTEGER_num(ri->pcrSelection);
+    if (n <= 0) {
+        LOG_err("TPM20QuoteRespInfo: pcrSelection missing or empty");
+        goto done;
+    }
+    for (i = 0; i < n; i++) {
+        ASN1_INTEGER *ai = sk_ASN1_INTEGER_value(ri->pcrSelection, i);
+        long v;
+        if (ai == NULL) goto done;
+        v = ASN1_INTEGER_get(ai);
+        if (v < 0 || v > 23) {
+            LOG(FL_ERR, "TPM20QuoteRespInfo: PCRIndex %ld out of range (0..23)", v);
             goto done;
         }
-        for (i = 0; i < n; i++) {
-            ASN1_INTEGER *ai = sk_ASN1_INTEGER_value(tap->pcrs, i);
-            long v;
-            if (ai == NULL) goto done;
-            v = ASN1_INTEGER_get(ai);
-            if (v < 0 || v >= 24) {
-                LOG(FL_ERR, "TpmAttestationParams: PCR index %ld out of range "
-                            "(must be 0..23)", v);
-                goto done;
-            }
-            if (*out_count >= out_max) {
-                LOG(FL_ERR, "TpmAttestationParams: too many PCRs (max %zu)", out_max);
-                goto done;
-            }
-            out_pcrs[(*out_count)++] = (unsigned int)v;
+        if (*out_count >= out_max) {
+            LOG(FL_ERR, "TPM20QuoteRespInfo: too many PCRs (max %zu)", out_max);
+            goto done;
         }
+        out_pcrs[(*out_count)++] = (unsigned int)v;
     }
-    /* else: pcrs absent — *out_count stays 0, caller uses default */
 
-    /* hashAlgId field — OPTIONAL */
-    if (tap->hashAlgId != NULL) {
-        long alg = ASN1_INTEGER_get(tap->hashAlgId);
-        if (alg <= 0) {
-            LOG(FL_ERR, "TpmAttestationParams: invalid hashAlgId %ld", alg);
-            goto done;
-        }
-        *out_hash_alg_id = (unsigned int)alg;
+    /* hashAlgo — MANDATORY (TPM_ALG_ID, 1..65535) */
+    alg = ASN1_INTEGER_get(ri->hashAlgo);
+    if (alg <= 0 || alg > 0xFFFF) {
+        LOG(FL_ERR, "TPM20QuoteRespInfo: hashAlgo %ld out of range (1..65535)", alg);
+        goto done;
     }
-    /* else: hashAlgId absent — *out_hash_alg_id stays at caller's default */
+    *out_hash_alg_id = (unsigned int)alg;
 
     ret = 1;
  done:
-    LOCAL_TPM_ATTESTATION_PARAMS_free(tap);
+    TPM20_QUOTE_RESP_INFO_free(ri);
     if (!ret)
         *out_count = 0;
     return ret;
 }
 
 /*
- * extract_tpm_attestation_params_for_quote
- * -----------------------------------------
- * Read the NonceResponse.respInfo stored on the CTX, check that
- * NonceResponse.type matches TPM_PCR_SELECTION_OID, and decode respInfo as
- * a TpmAttestationParams.
- *
- * Returns 1 on success, 0 when the response carries no type/respInfo at all
- * (caller may fall back to the historical defaults), and -1 when respInfo is
- * present but unusable (type mismatch, wrong ASN.1 type, malformed
- * TpmAttestationParams).  Callers must treat -1 as a hard error: silently
- * quoting defaults the RA/CA did not select would bypass its PCR policy.
- *
- * On return 1, *out_count == 0 means pcrs was absent (use default PCRs 0..4).
- * *out_hash_alg_id retains its caller-provided value when hashAlgId is absent.
+ * extract_tpm20_quote_resp_info
+ * ------------------------------
+ * Read NonceResponse.respInfo off the CTX, require NonceResponse.type ==
+ * TPM_PCR_SELECTION_OID, and decode respInfo as a TPM20QuoteRespInfo.
+ * Returns: 1 = success (out_count > 0, out_hash_alg_id set); 0 = no type/respInfo
+ * at all (caller may use defaults); -1 = present but unusable.  Callers MUST treat
+ * -1 as fatal — quoting defaults the RA/CA did not select bypasses its PCR policy.
  */
-static int extract_tpm_attestation_params_for_quote(OSSL_CMP_CTX *ctx,
-                                                    unsigned int *out_pcrs,
-                                                    size_t out_max,
-                                                    size_t *out_count,
-                                                    unsigned int *out_hash_alg_id)
+static int extract_tpm20_quote_resp_info(OSSL_CMP_CTX *ctx,
+                                         unsigned int *out_pcrs,
+                                         size_t out_max,
+                                         size_t *out_count,
+                                         unsigned int *out_hash_alg_id)
 {
     const ASN1_OBJECT *type_obj = OSSL_CMP_CTX_get0_rats_resp_type(ctx);
     const ASN1_TYPE *resp_info = OSSL_CMP_CTX_get0_rats_resp_info(ctx);
@@ -837,12 +837,12 @@ static int extract_tpm_attestation_params_for_quote(OSSL_CMP_CTX *ctx,
         LOG(FL_ERR, "NonceResponse.respInfo could not be re-encoded to DER");
         return -1;
     }
-    ok = parse_tpm_attestation_params_der(full, full_len,
-                                          out_pcrs, out_max,
-                                          out_count, out_hash_alg_id);
+    ok = parse_tpm20_quote_resp_info_der(full, full_len,
+                                         out_pcrs, out_max,
+                                         out_count, out_hash_alg_id);
     OPENSSL_free(full);
     if (!ok) {
-        LOG(FL_ERR, "NonceResponse.respInfo is not a valid TpmAttestationParams");
+        LOG(FL_ERR, "NonceResponse.respInfo is not a valid TPM20QuoteRespInfo");
         return -1;
     }
     return 1;
@@ -1031,7 +1031,7 @@ static X509_EXTENSIONS *getTPMAttestExtFromFiles(const char *tpms_attest_path,
  * Pulls the single RATS nonce from |ctx| (placed there by the prior
  * GenM/GenP nonce exchange per the attestation-freshness draft) and uses it
  * as TPM2_Quote.qualifyingData.  PCR selection and hash bank come from
- * NonceResponse.respInfo (TpmAttestationParams); absent respInfo falls back
+ * NonceResponse.respInfo (TPM20QuoteRespInfo); absent respInfo falls back
  * to the E2E defaults (PCRs 0..4, SHA-256).
  *
  * A zero-length nonce means the RA/CA does not require a freshness proof;
@@ -1110,7 +1110,7 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
         const unsigned int *pcr_arg = NULL;
         size_t pcr_arg_count = 0;
 
-        int params_rc = extract_tpm_attestation_params_for_quote(ctx, verifier_pcrs,
+        int params_rc = extract_tpm20_quote_resp_info(ctx, verifier_pcrs,
                                                                  sizeof(verifier_pcrs) / sizeof(verifier_pcrs[0]),
                                                                  &verifier_pcr_count,
                                                                  &verifier_hash_alg_id);
@@ -1141,7 +1141,7 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
             LOG(FL_INFO, "getTPMAttestExtNative: verifier hashAlgId=0x%04X (SHA-256=0x000B)",
                 verifier_hash_alg_id);
         } else {
-            LOG(FL_WARN, "getTPMAttestExtNative: no TpmAttestationParams in "
+            LOG(FL_WARN, "getTPMAttestExtNative: no TPM20QuoteRespInfo in "
                          "NonceResponse.respInfo — falling back to default "
                          "PCRs 0..4");
         }
@@ -2355,14 +2355,14 @@ static int setup_ctx(CMP_CTX *ctx)
             LOG_warn("-tpm_subject_pub_der is ignored (reserved; native certify "
                      "uses -tpm_subject_pem)");
         /* Propose SHA-256 (0x000B) as the preferred hash.  The RA/CA echoes the
-         * accepted value in NonceResponse.respInfo (TpmAttestationParams).  The
+         * accepted value in NonceResponse.respInfo (TPM20QuoteRespInfo).  The
          * NonceRequest request-type OID selects the attestation profile under
          * which the RA/CA stores the nonce: TPM_KEY_ATTEST_OID for certify
          * (→ TcgAttestCertify 2.23.133.20.1) or TPM_PCR_SELECTION_OID for the
          * quote default (→ TcgAttestQuote 2.23.133.20.2). */
         if (opt_tpm_ak_handle_str != NULL) {
             unsigned char *tap_der = NULL;
-            int tap_len = build_tpm_hash_proposal_der(0x000B, &tap_der);
+            int tap_len = build_tpm20_quote_req_info_der(0x000B, &tap_der);
             const int is_certify = (opt_tpm_attest_type != NULL
                                     && strcmp(opt_tpm_attest_type, "certify") == 0);
             const char *reqinfo_oid = is_certify ? get_tpm_key_attest_oid()
@@ -2371,7 +2371,7 @@ static int setup_ctx(CMP_CTX *ctx)
             /* Hand OpenSSL an opaque (type OID, reqInfo DER) pair; the TPM
              * payload encoding stays here in the client.  The reqInfo SEQUENCE
              * is opaque to the CMP layer — certify ignores the PCR/hash
-             * negotiation but a valid TpmAttestationParams is harmless. */
+             * negotiation but a valid TPM20QuoteReqInfo is harmless. */
             if (tap_len <= 0
                     || !OSSL_CMP_CTX_set1_rats_reqInfo(ctx, reqinfo_oid,
                                                        tap_der, tap_len)) {
