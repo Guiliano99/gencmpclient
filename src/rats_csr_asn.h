@@ -131,31 +131,36 @@ typedef struct local_key_pop_proof_st {
 
 DECLARE_ASN1_FUNCTIONS(LOCAL_KEY_POP_PROOF)
 
-/* ── TpmAttestationParams ASN.1 type (SPEC §DR-11, replaces TpmPcrSelection) ─
+/* ── TPM 2.0 quote freshness open types (attestation-freshness draft) ────────
  *
- *   TpmAttestationParams ::= SEQUENCE {
- *       pcrs       SEQUENCE OF INTEGER OPTIONAL,
- *       hashAlgId  INTEGER             OPTIONAL
- *   }
+ *   TPM20QuoteReqInfo ::= SEQUENCE {         -- attester → RA (NonceRequest.reqInfo)
+ *       certificateName   SEQUENCE OF UTF8String OPTIONAL,   -- candidate AK certs
+ *       supportedHashAlgo SEQUENCE OF TPMAlgId    OPTIONAL }  -- proposed banks
+ *   TPM20QuoteRespInfo ::= SEQUENCE {        -- RA → attester (NonceResponse.respInfo)
+ *       certificateName UTF8String         OPTIONAL,  -- RA-selected AK cert
+ *       pcrSelection    SEQUENCE OF PCRIndex,         -- MANDATORY, RA-mandated PCRs
+ *       hashAlgo        TPMAlgId }                     -- MANDATORY, selected bank
  *
- * Used under ``TPM_PCR_SELECTION_OID`` in both CMP directions:
- *
- * Attester → MockCA (genm reqInfo):
- *   {hashAlgId=0x000B}  — SHA-256 proposal; pcrs absent.
- *
- * MockCA → attester (genp respInfo):
- *   {pcrs=[0..4], hashAlgId=0x000B}  — PCR list + accepted/counter-proposed alg.
- *
- * Both fields are OPTIONAL.  When ``pcrs`` is absent in the response the
- * attester falls back to the default PCR list (0..4).  When ``hashAlgId``
- * is absent the attester uses SHA-256.
+ * TPMAlgId 1..65535 (SHA-256=11), PCRIndex 0..23 — ranges checked in code.
+ * Req fields are untagged SEQUENCE OF (libattest UpdateV8 wire format): a lone
+ * one is ambiguous, so do NOT add [0]/[1] tags without matching libattest + the
+ * Python decoder.  The client only ENCODES the req (both present → moot) and
+ * DECODES the resp (distinct tags → unambiguous).  Replaces TpmAttestationParams.
  */
-typedef struct local_tpm_attestation_params_st {
-    STACK_OF(ASN1_INTEGER) *pcrs;      /* SEQUENCE OF INTEGER OPTIONAL */
-    ASN1_INTEGER           *hashAlgId; /* INTEGER OPTIONAL              */
-} LOCAL_TPM_ATTESTATION_PARAMS;
+typedef struct tpm20_quote_req_info_st {
+    STACK_OF(ASN1_UTF8STRING) *certificateName;   /* SEQUENCE OF UTF8String OPTIONAL */
+    STACK_OF(ASN1_INTEGER)    *supportedHashAlgo; /* SEQUENCE OF TPMAlgId    OPTIONAL */
+} TPM20_QUOTE_REQ_INFO;
 
-DECLARE_ASN1_FUNCTIONS(LOCAL_TPM_ATTESTATION_PARAMS)
+DECLARE_ASN1_FUNCTIONS(TPM20_QUOTE_REQ_INFO)
+
+typedef struct tpm20_quote_resp_info_st {
+    ASN1_UTF8STRING        *certificateName; /* UTF8String OPTIONAL              */
+    STACK_OF(ASN1_INTEGER) *pcrSelection;    /* SEQUENCE OF PCRIndex (MANDATORY) */
+    ASN1_INTEGER           *hashAlgo;        /* TPMAlgId (MANDATORY)             */
+} TPM20_QUOTE_RESP_INFO;
+
+DECLARE_ASN1_FUNCTIONS(TPM20_QUOTE_RESP_INFO)
 
 /*
  * ATT_BUNDLE_get_certs_from_der - extract the certificate chain from an

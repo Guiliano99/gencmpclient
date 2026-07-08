@@ -55,13 +55,29 @@ ASN1_SEQUENCE(LOCAL_KEY_POP_CHALLENGE) = {
 } ASN1_SEQUENCE_END(LOCAL_KEY_POP_CHALLENGE)
 IMPLEMENT_ASN1_FUNCTIONS(LOCAL_KEY_POP_CHALLENGE)
 
-/* ── TpmAttestationParams (SPEC §DR-11, replaces TpmPcrSelection) ─────── */
+/* ── TPM 2.0 quote freshness open types (attestation-freshness draft) ────────
+ *
+ *   TPM20QuoteReqInfo ::= SEQUENCE {
+ *       certificateName   SEQUENCE OF UTF8String OPTIONAL,
+ *       supportedHashAlgo SEQUENCE OF TPMAlgId    OPTIONAL }
+ *   TPM20QuoteRespInfo ::= SEQUENCE {
+ *       certificateName UTF8String         OPTIONAL,
+ *       pcrSelection    SEQUENCE OF PCRIndex,   -- MANDATORY
+ *       hashAlgo        TPMAlgId }              -- MANDATORY
+ *
+ * See rats_csr_asn.h for the untagged-SEQUENCE-OF wire caveat and value ranges. */
+ASN1_SEQUENCE(TPM20_QUOTE_REQ_INFO) = {
+    ASN1_SEQUENCE_OF_OPT(TPM20_QUOTE_REQ_INFO, certificateName,   ASN1_UTF8STRING),
+    ASN1_SEQUENCE_OF_OPT(TPM20_QUOTE_REQ_INFO, supportedHashAlgo, ASN1_INTEGER),
+} ASN1_SEQUENCE_END(TPM20_QUOTE_REQ_INFO)
+IMPLEMENT_ASN1_FUNCTIONS(TPM20_QUOTE_REQ_INFO)
 
-ASN1_SEQUENCE(LOCAL_TPM_ATTESTATION_PARAMS) = {
-    ASN1_SEQUENCE_OF_OPT(LOCAL_TPM_ATTESTATION_PARAMS, pcrs,      ASN1_INTEGER),
-    ASN1_OPT(            LOCAL_TPM_ATTESTATION_PARAMS, hashAlgId, ASN1_INTEGER),
-} ASN1_SEQUENCE_END(LOCAL_TPM_ATTESTATION_PARAMS)
-IMPLEMENT_ASN1_FUNCTIONS(LOCAL_TPM_ATTESTATION_PARAMS)
+ASN1_SEQUENCE(TPM20_QUOTE_RESP_INFO) = {
+    ASN1_OPT        (TPM20_QUOTE_RESP_INFO, certificateName, ASN1_UTF8STRING),
+    ASN1_SEQUENCE_OF(TPM20_QUOTE_RESP_INFO, pcrSelection,    ASN1_INTEGER),
+    ASN1_SIMPLE     (TPM20_QUOTE_RESP_INFO, hashAlgo,        ASN1_INTEGER),
+} ASN1_SEQUENCE_END(TPM20_QUOTE_RESP_INFO)
+IMPLEMENT_ASN1_FUNCTIONS(TPM20_QUOTE_RESP_INFO)
 
 STACK_OF(X509) *ATT_BUNDLE_get_certs_from_der(const unsigned char *der,
                                                long der_len)
