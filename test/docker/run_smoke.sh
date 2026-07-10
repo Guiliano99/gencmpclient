@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Shared entrypoint for the tpm_ops smoke-test images (Dockerfile.ibm /
+# Shared entrypoint for the tpm_py_bridge smoke-test images (Dockerfile.ibm /
 # Dockerfile.swtpm).  Starts the simulator named by $SIM, provisions a
 # restricted-signing AK, and runs the harness built into the image.
 #
@@ -14,7 +14,7 @@ set -euo pipefail
 SIM="${SIM:?SIM must be set to 'ibm' or 'swtpm'}"
 PORT="${PORT:-2321}"
 AK_HANDLE="${AK_HANDLE:-0x81010002}"
-BIN="${BIN:-/opt/tpm-smoke/tpm_ops_smoke}"
+BIN="${BIN:-/opt/tpm-smoke/tpm_py_bridge_smoke}"
 STATE="$(mktemp -d)"
 SIM_PID=""
 
@@ -55,7 +55,8 @@ tpm2_startup -c 2>/dev/null || true
 
 # AK as a restricted-signing PRIMARY: a single transient object (survives the
 # tiny object-memory limit of minimal simulators) and a valid TPM2_Quote signer
-# whose fixed rsassa-sha256 scheme is what tpm_quote_pcrs() resolves to.
+# whose fixed rsassa-sha256 scheme is what libattest-py's TpmClient.quote()
+# resolves to.
 echo "==> [$SIM] provisioning restricted-signing AK at $AK_HANDLE"
 tpm2_evictcontrol -C o -c "$AK_HANDLE" >/dev/null 2>&1 || true   # clear stale
 tpm2_createprimary -C o -g sha256 -G "rsa2048:rsassa:null" \

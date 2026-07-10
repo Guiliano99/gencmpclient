@@ -1,16 +1,31 @@
 # syntax=docker/dockerfile:1
 #
-# Smoke-test image: build src/tpm_ops.c and run it against the IBM reference
-# TPM 2.0 simulator (ibmswtpm2 / tpm_server).
+# Smoke-test image: build src/tpm_py_bridge.c and run it against the IBM
+# reference TPM 2.0 simulator (ibmswtpm2 / tpm_server).  Exercises
+# tpm2_quote_generate_evidence() only — see test/tpm_py_bridge_smoke.c for
+# what is and isn't covered.
 #
 # Build (from the repo root, so the COPY paths resolve):
-#   docker build -f test/docker/Dockerfile.ibm -t tpm-ops-smoke:ibm .
+#   docker build -f test/docker/Dockerfile.ibm -t tpm-py-bridge-smoke:ibm .
 # Run:
-#   docker run --rm tpm-ops-smoke:ibm
+#   docker run --rm tpm-py-bridge-smoke:ibm
 #
 # Expects the repo's prebuilt libsecutils.so.2.0 at the context root.
 
-# ── stage 1: build the IBM simulator binary from source ─────────────────────
+# ── stage: libattest-py source (not vendored in this repo, see
+# src/tpm_py_bridge.h) — clone the branch that provides
+# libattest.attester.evidence_bridge.generate_tpm_evidence(kind="quote"), the
+# only entry point this smoke image exercises.  Override with
+# --build-arg LIBATTEST_BRANCH=... to track a newer branch once published.
+FROM debian:13-slim AS src-libattest
+ARG LIBATTEST_REPO=https://github.com/Guiliano99/libattest-py.git
+ARG LIBATTEST_BRANCH=UpdateV8
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 --branch "${LIBATTEST_BRANCH}" "${LIBATTEST_REPO}" /src \
+    && rm -rf /src/.git
+
+# ── stage: build the IBM simulator binary from source ────────────────────────
 # Built on bookworm (OpenSSL 3.0): ibmswtpm2 rev183 has a version guard in
 # BnToOsslMath.h that #errors on trixie's OpenSSL 3.5 ("Untested OpenSSL
 # version").  The resulting tpm_server links libcrypto.so.3 and runs fine on
@@ -25,30 +40,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && make -C /tmp/ibmswtpm2/src -j"$(nproc)" \
     && cp /tmp/ibmswtpm2/src/tpm_server /usr/local/bin/tpm_server
 
-# ── stage 2: runtime + harness ──────────────────────────────────────────────
+# ── stage: runtime + harness ─────────────────────────────────────────────────
 FROM debian:13-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc libc6-dev libssl-dev \
         libtss2-dev libtss2-tcti-mssim0t64 \
         tpm2-tools \
+        python3-dev python3-pip \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=ibmtpm /usr/local/bin/tpm_server /usr/local/bin/tpm_server
 
+# libattest-py's own dependencies (tpm2-pytss is a CFFI extension) go into the
+# system Python so the embedded interpreter finds them without extra
+# sys.path setup; only libattest's own source needs the explicit PYTHONPATH
+# below (see src/tpm_py_bridge.h for why: an editable install's .pth redirect
+# is not processed for a plain PYTHONPATH directory).
+RUN pip install --break-system-packages --no-cache-dir \
+        "cryptography>=42" "pyasn1>=0.6" "pyasn1-alt-modules>=0.4" "tpm2-pytss>=2.3"
+COPY --from=src-libattest /src/src/libattest /opt/libattest/src/libattest
+ENV PYTHONPATH=/opt/libattest/src
+
 WORKDIR /opt/tpm-smoke
-COPY src/tpm_ops.c src/tpm_ops.h ./src/
-COPY test/tpm_ops_smoke.c ./test/
+COPY src/tpm_py_bridge.c src/tpm_py_bridge.h ./src/
+COPY test/tpm_py_bridge_smoke.c ./test/
 COPY libsecutils.so.2.0 ./
 COPY libsecutils/src/libsecutils/include ./secutils-include/
 COPY test/docker/run_smoke.sh ./run_smoke.sh
 
-RUN gcc -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
-        -I ./src -I ./secutils-include \
-        ./test/tpm_ops_smoke.c ./src/tpm_ops.c \
-        -L. -l:libsecutils.so.2.0 -lcrypto \
-        -ltss2-esys -ltss2-tctildr -ltss2-mu -ltss2-rc \
-        -Wl,-rpath,/opt/tpm-smoke -o tpm_ops_smoke \
+RUN PYINC="$(python3-config --includes)" && \
+    PYLDFLAGS="$(python3-config --ldflags --embed)" && \
+    gcc -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
+        $PYINC -I ./src -I ./secutils-include \
+        ./test/tpm_py_bridge_smoke.c ./src/tpm_py_bridge.c \
+        -L. -l:libsecutils.so.2.0 -lcrypto $PYLDFLAGS \
+        -Wl,-rpath,/opt/tpm-smoke -o tpm_py_bridge_smoke \
     && chmod +x run_smoke.sh
 
-ENV SIM=ibm PORT=2321 AK_HANDLE=0x81010002 BIN=/opt/tpm-smoke/tpm_ops_smoke
+ENV SIM=ibm PORT=2321 AK_HANDLE=0x81010002 BIN=/opt/tpm-smoke/tpm_py_bridge_smoke
 ENTRYPOINT ["/opt/tpm-smoke/run_smoke.sh"]
