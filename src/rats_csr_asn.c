@@ -24,19 +24,9 @@ ASN1_SEQUENCE(LOCAL_ATT_BUNDLE) = {
 } ASN1_SEQUENCE_END(LOCAL_ATT_BUNDLE)
 IMPLEMENT_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
 
-ASN1_SEQUENCE(TCG_ATTEST_CERTIFY) = {
-    ASN1_SIMPLE(TCG_ATTEST_CERTIFY, tpmSAttest, ASN1_OCTET_STRING),
-    ASN1_SIMPLE(TCG_ATTEST_CERTIFY, signature,  ASN1_OCTET_STRING),
-    ASN1_OPT(TCG_ATTEST_CERTIFY,    tpmTPublic, ASN1_OCTET_STRING),
-} ASN1_SEQUENCE_END(TCG_ATTEST_CERTIFY)
-IMPLEMENT_ASN1_FUNCTIONS(TCG_ATTEST_CERTIFY)
-
-ASN1_SEQUENCE(TCG_ATTEST_QUOTE) = {
-    ASN1_SIMPLE(TCG_ATTEST_QUOTE, tpmSAttest, ASN1_OCTET_STRING),
-    ASN1_SIMPLE(TCG_ATTEST_QUOTE, signature,  ASN1_OCTET_STRING),
-    ASN1_OPT(TCG_ATTEST_QUOTE,    pcrValues,  ASN1_OCTET_STRING),
-} ASN1_SEQUENCE_END(TCG_ATTEST_QUOTE)
-IMPLEMENT_ASN1_FUNCTIONS(TCG_ATTEST_QUOTE)
+/* The TcgAttestCertify / TcgAttestQuote statement DER is generated in
+ * libattest-py (formats/tpm/tcg.py) and crosses the tpm_py_bridge.c bridge as
+ * opaque bytes; gencmpclient no longer declares those structures. */
 
 /* ── KeyAttestPoP types (SPEC §DR-1) ─────────────────────────────────────── */
 

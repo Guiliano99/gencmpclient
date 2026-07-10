@@ -48,41 +48,11 @@ typedef struct local_att_bundle_st {
 
 DECLARE_ASN1_FUNCTIONS(LOCAL_ATT_BUNDLE)
 
-/* ── TCG TPM2 attestation statement types ────────────────────────────────────
- *
- * draft-birkholz-rats-tcg-tpm2-attestation defines two statement types:
- *
- *   TcgAttestCertify ::= SEQUENCE {      -- OID 2.23.133.20.1 (key attestation)
- *       tpmSAttest  OCTET STRING,
- *       signature   OCTET STRING,
- *       tpmTPublic  OCTET STRING OPTIONAL
- *   }
- *
- *   TcgAttestQuote ::= SEQUENCE {        -- OID 2.23.133.20.2 (platform attestation)
- *       tpmSAttest  OCTET STRING,
- *       signature   OCTET STRING,
- *       pcrValues   OCTET STRING OPTIONAL
- *   }
- *
- * These types are used by getTPMAttestExtFromFiles() in cmpClient.c to build
- * an id-aa-attestation CSR extension directly from on-disk TPM binary blobs,
- * without going through the ATG library.
- */
-typedef struct tcg_attest_certify_st {
-    ASN1_OCTET_STRING *tpmSAttest;
-    ASN1_OCTET_STRING *signature;
-    ASN1_OCTET_STRING *tpmTPublic; /* OPTIONAL */
-} TCG_ATTEST_CERTIFY;
-
-DECLARE_ASN1_FUNCTIONS(TCG_ATTEST_CERTIFY)
-
-typedef struct tcg_attest_quote_st {
-    ASN1_OCTET_STRING *tpmSAttest;
-    ASN1_OCTET_STRING *signature;
-    ASN1_OCTET_STRING *pcrValues;  /* OPTIONAL */
-} TCG_ATTEST_QUOTE;
-
-DECLARE_ASN1_FUNCTIONS(TCG_ATTEST_QUOTE)
+/* The TcgAttestCertify / TcgAttestQuote statement structures are NOT declared
+ * here.  Their DER is generated in libattest-py (formats/tpm/tcg.py) and handed
+ * to gencmpclient as opaque bytes across the tpm_py_bridge.c CPython bridge,
+ * so the statement ASN.1 has a single source of truth in Python.  The C side
+ * only wraps the opaque statement DER into LOCAL_ATT_STMT / LOCAL_ATT_BUNDLE. */
 
 /* ── KeyAttestPoP ASN.1 types (SPEC §DR-1, v2) ─────────────────────────────
  *
