@@ -83,12 +83,17 @@ int tpm2_quote_generate_evidence(const char *tcti_str,
 /*
  * tpm2_key_attest_generate_evidence
  * -----------------------------------
- * Drive TPM2_Certify (via libattest-py) of the subject key loaded from the
- * "TSS2 PRIVATE KEY" PEM at |subject_key_pem_path|, certified by the AK at
- * |ak_handle|, and hand back the DER-encoded TcgAttestCertify evidence
- * statement plus its AttestationStatement.type OID.
+ * Drive the v5 credential-activation key-attestation flow (via libattest-py) for
+ * the subject key loaded from the "TSS2 PRIVATE KEY" PEM at |subject_key_pem_path|,
+ * certified by the AK at |ak_handle|: recover the verifier seed via
+ * TPM2_ActivateCredential from the MakeCredential blobs, TPM2_Certify the subject,
+ * Esys_Sign H(seed), and hand back the DER-encoded KeyAttestEvidence statement
+ * plus its AttestationStatement.type OID.
  *
  * |nonce|/|nonce_len| populate the qualifyingData (freshness).
+ * |key_attest_resp_der|/|key_attest_resp_len| are the DER KeyAttestResp the CA
+ * returned in NonceResponse.respInfo (carrying encSeed/encSecret) — the Python
+ * bridge decodes it, so the C caller stays free of the KeyAttestResp ASN.1.
  * |corrupt_signature| — see tpm2_quote_generate_evidence.
  *
  * Output ownership: same as tpm2_quote_generate_evidence.
@@ -100,9 +105,50 @@ int tpm2_key_attest_generate_evidence(const char *tcti_str,
                                       uint32_t ak_handle,
                                       const char *subject_key_pem_path,
                                       const unsigned char *nonce, size_t nonce_len,
+                                      const unsigned char *key_attest_resp_der,
+                                      size_t key_attest_resp_len,
                                       int corrupt_signature,
                                       unsigned char **evidence_der_out, size_t *evidence_der_len,
                                       char **type_oid_out);
+
+/*
+ * tpm2_build_key_attest_chall
+ * ----------------------------
+ * Build the DER KeyAttestChall for the CMP NonceRequest.reqInfo (via libattest-py):
+ * read the AK Name and the deterministic EK public from the TPM at |ak_handle|, and
+ * pair them with the EK certificate chain at |ek_cert_chain| (a PEM file path or
+ * inline PEM — the -ekCertChain flag passes a path). The Verifier uses ekPublic to
+ * run TPM2_MakeCredential and akName as the bound Name.  The C caller treats the
+ * result as opaque DER.
+ *
+ * On success |*chall_der_out| is newly-allocated (OPENSSL_malloc'd) and must be
+ * freed by the caller with OPENSSL_free().
+ *
+ * Returns 1 on success, 0 on any failure (a Python-side exception, if any, is
+ * logged via LOG_err before returning).
+ */
+int tpm2_build_key_attest_chall(const char *tcti_str,
+                                uint32_t ak_handle,
+                                const char *ek_cert_chain,
+                                unsigned char **chall_der_out, size_t *chall_der_len);
+
+/*
+ * eareat_hpke_encrypt_ear
+ * ------------------------
+ * Privacy-wrap an already signed ATG EAT/JWT token with JOSE-HPKE-0 and return
+ * DER(CMW json UTF8String) bytes for AttestationStatement.stmt.
+ *
+ * |enc_private_key_pem| is a verifier P-256 HPKE recipient private key PEM; the
+ * Python helper derives its public key and encrypts to that public key. This is
+ * a PoC seam for the local EarEatHpkeDemo worktree; production should pass a
+ * pinned public verifier encryption credential instead.
+ *
+ * Output ownership: |*cmw_der_out| is OPENSSL_malloc'd and must be freed by the
+ * caller with OPENSSL_free().
+ */
+int eareat_hpke_encrypt_ear(const char *enc_private_key_pem,
+                            const unsigned char *ear, size_t ear_len,
+                            unsigned char **cmw_der_out, size_t *cmw_der_len);
 
 # ifdef __cplusplus
 }

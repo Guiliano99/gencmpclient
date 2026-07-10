@@ -31,6 +31,12 @@
  *    see the TPMPCRDemo/TPMKeyAttestDemo Dockerfiles.
  */
 
+/* Must be defined before including Python.h so the "#" length format codes
+ * (y#, s#) below bind Py_ssize_t lengths, not int.  Python 3.10+ turns the
+ * mismatch into a hard error ("PY_SSIZE_T_CLEAN macro must be defined for '#'
+ * formats"), which aborts every generate_tpm_evidence call.  The length vars
+ * here are already Py_ssize_t, so this define is all that was missing. */
+#define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
 #include <stdio.h>
@@ -46,6 +52,10 @@
 
 static PyObject *g_bridge_module = NULL;
 static PyObject *g_generate_func = NULL;
+static PyObject *g_key_attest_func = NULL;
+static PyObject *g_build_chall_func = NULL;
+static PyObject *g_hpke_module = NULL;
+static PyObject *g_encrypt_ear_func = NULL;
 
 /* Lazily initialize the embedded interpreter and resolve
  * libattest.attester.evidence_bridge.generate_tpm_evidence once.  Idempotent;
@@ -75,6 +85,59 @@ static int ensure_python_ready(void)
         LOG_err("tpm_py_bridge: generate_tpm_evidence not found/callable in "
                 "libattest.attester.evidence_bridge");
         Py_CLEAR(g_generate_func);
+        return 0;
+    }
+    return 1;
+}
+
+/* Resolve an additional callable |name| from the (already-imported)
+ * evidence_bridge module into |*cache| on first use.  Returns the cached
+ * callable (borrowed — the cache owns the reference) or NULL on failure. */
+static PyObject *ensure_bridge_callable(PyObject **cache, const char *name)
+{
+    if (*cache != NULL)
+        return *cache;
+    if (!ensure_python_ready())
+        return NULL;
+
+    *cache = PyObject_GetAttrString(g_bridge_module, name);
+    if (*cache == NULL || !PyCallable_Check(*cache)) {
+        PyErr_Print();
+        LOG(FL_ERR, "tpm_py_bridge: %s not found/callable in "
+                    "libattest.attester.evidence_bridge", name);
+        Py_CLEAR(*cache);
+        return NULL;
+    }
+    return *cache;
+}
+
+/* Resolve src/eareat_hpke_bridge.py::encrypt_ear_with_hpke. The module lives
+ * next to this C file in the gencmpclient source tree, so the attester image
+ * must include gencmpclient/src on PYTHONPATH when the HPKE path is enabled. */
+static int ensure_hpke_ready(void)
+{
+    if (g_encrypt_ear_func != NULL)
+        return 1;
+
+    if (!Py_IsInitialized())
+        Py_Initialize();
+
+    if (g_hpke_module == NULL) {
+        g_hpke_module = PyImport_ImportModule("eareat_hpke_bridge");
+        if (g_hpke_module == NULL) {
+            PyErr_Print();
+            LOG_err("tpm_py_bridge: could not import eareat_hpke_bridge — "
+                    "is gencmpclient/src on PYTHONPATH?");
+            return 0;
+        }
+    }
+
+    g_encrypt_ear_func = PyObject_GetAttrString(g_hpke_module, "encrypt_ear_with_hpke");
+    if (g_encrypt_ear_func == NULL || !PyCallable_Check(g_encrypt_ear_func)) {
+        PyErr_Print();
+        LOG_err("tpm_py_bridge: encrypt_ear_with_hpke not found/callable in "
+                "eareat_hpke_bridge");
+        Py_CLEAR(g_encrypt_ear_func);
         return 0;
     }
     return 1;
@@ -136,6 +199,40 @@ static int build_pcr_selection(const unsigned int *pcr_indices, size_t pcr_count
     return 1;
 }
 
+/* Unpack a Python (evidence_der: bytes, type_oid: str) 2-tuple into caller-owned
+ * OPENSSL_malloc'd buffers.  Returns 1/0; does NOT DECREF |result| (the caller
+ * owns it).  Shared by every evidence generator (quote / key-attest). */
+static int unpack_evidence_result(PyObject *result,
+                                  unsigned char **evidence_der_out, size_t *evidence_der_len,
+                                  char **type_oid_out)
+{
+    const char *der_ptr = NULL, *oid_cstr = NULL;
+    Py_ssize_t der_len = 0;
+
+    if (!PyArg_ParseTuple(result, "y#s", &der_ptr, &der_len, &oid_cstr)) {
+        log_python_error("evidence generator returned an unexpected shape");
+        return 0;
+    }
+
+    *evidence_der_out = OPENSSL_malloc((size_t)der_len);
+    if (*evidence_der_out == NULL) {
+        LOG_err("tpm_py_bridge: OPENSSL_malloc failed for evidence DER");
+        return 0;
+    }
+    memcpy(*evidence_der_out, der_ptr, (size_t)der_len);
+    *evidence_der_len = (size_t)der_len;
+
+    *type_oid_out = OPENSSL_strdup(oid_cstr);
+    if (*type_oid_out == NULL) {
+        LOG_err("tpm_py_bridge: OPENSSL_strdup failed for type OID");
+        OPENSSL_free(*evidence_der_out);
+        *evidence_der_out = NULL;
+        *evidence_der_len = 0;
+        return 0;
+    }
+    return 1;
+}
+
 /* Shared core: call generate_tpm_evidence(kind, nonce, tcti, ak_handle,
  * pcr_selection, subject_key_pem, corrupt_signature), unpack the returned
  * (evidence_der, type_oid) tuple, and copy both into caller-owned
@@ -150,8 +247,6 @@ static int call_generate_tpm_evidence(const char *kind,
                                       char **type_oid_out)
 {
     PyObject *result = NULL;
-    const char *der_ptr = NULL, *oid_cstr = NULL;
-    Py_ssize_t der_len = 0;
     int ok = 0;
 
     if (tcti_str == NULL || nonce == NULL
@@ -180,35 +275,12 @@ static int call_generate_tpm_evidence(const char *kind,
         return 0;
     }
 
-    if (!PyArg_ParseTuple(result, "y#s", &der_ptr, &der_len, &oid_cstr)) {
-        log_python_error("generate_tpm_evidence returned an unexpected shape");
-        goto done;
-    }
-
-    *evidence_der_out = OPENSSL_malloc((size_t)der_len);
-    if (*evidence_der_out == NULL) {
-        LOG_err("tpm_py_bridge: OPENSSL_malloc failed for evidence DER");
-        goto done;
-    }
-    memcpy(*evidence_der_out, der_ptr, (size_t)der_len);
-    *evidence_der_len = (size_t)der_len;
-
-    *type_oid_out = OPENSSL_strdup(oid_cstr);
-    if (*type_oid_out == NULL) {
-        LOG_err("tpm_py_bridge: OPENSSL_strdup failed for type OID");
-        OPENSSL_free(*evidence_der_out);
-        *evidence_der_out = NULL;
-        *evidence_der_len = 0;
-        goto done;
-    }
-
-    LOG(FL_INFO, "tpm_py_bridge: generate_tpm_evidence(kind=%s) produced "
-                "%zu-byte evidence DER, type OID %s",
-        kind, *evidence_der_len, *type_oid_out);
-    ok = 1;
-
-done:
+    ok = unpack_evidence_result(result, evidence_der_out, evidence_der_len, type_oid_out);
     Py_DECREF(result);
+    if (ok)
+        LOG(FL_INFO, "tpm_py_bridge: generate_tpm_evidence(kind=%s) produced "
+                    "%zu-byte evidence DER, type OID %s",
+            kind, *evidence_der_len, *type_oid_out);
     return ok;
 }
 
@@ -238,19 +310,171 @@ int tpm2_key_attest_generate_evidence(const char *tcti_str,
                                       uint32_t ak_handle,
                                       const char *subject_key_pem_path,
                                       const unsigned char *nonce, size_t nonce_len,
+                                      const unsigned char *key_attest_resp_der,
+                                      size_t key_attest_resp_len,
                                       int corrupt_signature,
                                       unsigned char **evidence_der_out, size_t *evidence_der_len,
                                       char **type_oid_out)
 {
-    if (subject_key_pem_path == NULL) {
-        LOG_err("tpm_py_bridge: tpm2_key_attest_generate_evidence requires "
-                "subject_key_pem_path (TSS2 PRIVATE KEY PEM of the subject key)");
+    PyObject *fn = NULL, *result = NULL;
+    int ok = 0;
+
+    if (tcti_str == NULL || subject_key_pem_path == NULL || nonce == NULL
+            || key_attest_resp_der == NULL
+            || evidence_der_out == NULL || evidence_der_len == NULL
+            || type_oid_out == NULL) {
+        LOG_err("tpm_py_bridge: invalid NULL argument to "
+                "tpm2_key_attest_generate_evidence");
+        return 0;
+    }
+    *evidence_der_out = NULL;
+    *evidence_der_len = 0;
+    *type_oid_out = NULL;
+
+    fn = ensure_bridge_callable(&g_key_attest_func, "generate_key_attest_evidence");
+    if (fn == NULL)
+        return 0;
+
+    /* generate_key_attest_evidence(nonce, tcti, ak_handle, subject_key_pem,
+     *                              key_attest_resp_der, corrupt_signature) */
+    result = PyObject_CallFunction(fn, "y#sIsy#i",
+                                   (const char *)nonce, (Py_ssize_t)nonce_len,
+                                   tcti_str,
+                                   (unsigned int)ak_handle,
+                                   subject_key_pem_path,
+                                   (const char *)key_attest_resp_der,
+                                   (Py_ssize_t)key_attest_resp_len,
+                                   corrupt_signature ? 1 : 0);
+    if (result == NULL) {
+        log_python_error("generate_key_attest_evidence call failed");
         return 0;
     }
 
-    return call_generate_tpm_evidence("certify", tcti_str, ak_handle,
-                                      nonce, nonce_len,
-                                      NULL, subject_key_pem_path,
-                                      corrupt_signature,
-                                      evidence_der_out, evidence_der_len, type_oid_out);
+    ok = unpack_evidence_result(result, evidence_der_out, evidence_der_len, type_oid_out);
+    Py_DECREF(result);
+    if (ok)
+        LOG(FL_INFO, "tpm_py_bridge: generate_key_attest_evidence produced "
+                    "%zu-byte evidence DER, type OID %s",
+            *evidence_der_len, *type_oid_out);
+    return ok;
+}
+
+int tpm2_build_key_attest_chall(const char *tcti_str,
+                                uint32_t ak_handle,
+                                const char *ek_cert_chain,
+                                unsigned char **chall_der_out, size_t *chall_der_len)
+{
+    PyObject *fn = NULL, *result = NULL;
+    const char *der_ptr = NULL;
+    Py_ssize_t der_len = 0;
+    int ok = 0;
+
+    if (tcti_str == NULL || ek_cert_chain == NULL
+            || chall_der_out == NULL || chall_der_len == NULL) {
+        LOG_err("tpm_py_bridge: invalid NULL argument to tpm2_build_key_attest_chall");
+        return 0;
+    }
+    *chall_der_out = NULL;
+    *chall_der_len = 0;
+
+    fn = ensure_bridge_callable(&g_build_chall_func, "build_key_attest_chall");
+    if (fn == NULL)
+        return 0;
+
+    /* build_key_attest_chall(tcti, ak_handle, ek_cert_chain) -> bytes */
+    result = PyObject_CallFunction(fn, "sIs",
+                                   tcti_str,
+                                   (unsigned int)ak_handle,
+                                   ek_cert_chain);
+    if (result == NULL) {
+        log_python_error("build_key_attest_chall call failed");
+        return 0;
+    }
+
+    if (!PyBytes_Check(result)) {
+        LOG_err("tpm_py_bridge: build_key_attest_chall did not return bytes");
+        goto done;
+    }
+    if (PyBytes_AsStringAndSize(result, (char **)&der_ptr, &der_len) < 0) {
+        log_python_error("build_key_attest_chall bytes extraction failed");
+        goto done;
+    }
+
+    *chall_der_out = OPENSSL_malloc((size_t)der_len);
+    if (*chall_der_out == NULL) {
+        LOG_err("tpm_py_bridge: OPENSSL_malloc failed for KeyAttestChall DER");
+        goto done;
+    }
+    memcpy(*chall_der_out, der_ptr, (size_t)der_len);
+    *chall_der_len = (size_t)der_len;
+    LOG(FL_INFO, "tpm_py_bridge: build_key_attest_chall produced %zu-byte "
+                "KeyAttestChall DER", *chall_der_len);
+    ok = 1;
+
+done:
+    Py_DECREF(result);
+    if (!ok) {
+        OPENSSL_free(*chall_der_out);
+        *chall_der_out = NULL;
+        *chall_der_len = 0;
+    }
+    return ok;
+}
+
+int eareat_hpke_encrypt_ear(const char *enc_private_key_pem,
+                            const unsigned char *ear, size_t ear_len,
+                            unsigned char **cmw_der_out, size_t *cmw_der_len)
+{
+    PyObject *result = NULL;
+    const char *der_ptr = NULL;
+    Py_ssize_t der_len = 0;
+    int ok = 0;
+
+    if (enc_private_key_pem == NULL || ear == NULL || ear_len == 0
+            || cmw_der_out == NULL || cmw_der_len == NULL) {
+        LOG_err("tpm_py_bridge: invalid NULL/empty argument to eareat_hpke_encrypt_ear");
+        return 0;
+    }
+    *cmw_der_out = NULL;
+    *cmw_der_len = 0;
+
+    if (!ensure_hpke_ready())
+        return 0;
+
+    result = PyObject_CallFunction(g_encrypt_ear_func, "sy#",
+                                   enc_private_key_pem,
+                                   (const char *)ear, (Py_ssize_t)ear_len);
+    if (result == NULL) {
+        log_python_error("encrypt_ear_with_hpke call failed");
+        return 0;
+    }
+
+    if (!PyBytes_Check(result)) {
+        LOG_err("tpm_py_bridge: encrypt_ear_with_hpke did not return bytes");
+        goto done;
+    }
+    if (PyBytes_AsStringAndSize(result, (char **)&der_ptr, &der_len) < 0) {
+        log_python_error("encrypt_ear_with_hpke bytes extraction failed");
+        goto done;
+    }
+
+    *cmw_der_out = OPENSSL_malloc((size_t)der_len);
+    if (*cmw_der_out == NULL) {
+        LOG_err("tpm_py_bridge: OPENSSL_malloc failed for HPKE CMW DER");
+        goto done;
+    }
+    memcpy(*cmw_der_out, der_ptr, (size_t)der_len);
+    *cmw_der_len = (size_t)der_len;
+    LOG(FL_INFO, "tpm_py_bridge: encrypt_ear_with_hpke produced %zu-byte CMW DER",
+        *cmw_der_len);
+    ok = 1;
+
+done:
+    Py_DECREF(result);
+    if (!ok) {
+        OPENSSL_free(*cmw_der_out);
+        *cmw_der_out = NULL;
+        *cmw_der_len = 0;
+    }
+    return ok;
 }
