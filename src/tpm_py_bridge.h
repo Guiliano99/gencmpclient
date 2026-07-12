@@ -150,6 +150,27 @@ int eareat_hpke_encrypt_ear(const char *enc_private_key_pem,
                             const unsigned char *ear, size_t ear_len,
                             unsigned char **cmw_der_out, size_t *cmw_der_len);
 
+/*
+ * eareat_cose_hpke_encrypt_ear
+ * -----------------------------
+ * Privacy-wrap an already signed ATG EAT/JWT token with COSE-HPKE
+ * (draft-ietf-cose-hpke) and return DER(CMW json UTF8String) bytes for
+ * AttestationStatement.stmt. Same call/ownership contract as
+ * eareat_hpke_encrypt_ear (JOSE-HPKE); this is the COSE counterpart, resolved
+ * from a separate Python module (src/eareat_cose_hpke_bridge.py) so the two
+ * wire formats stay independently selectable via distinct AttestationStatement
+ * OIDs (ATG_HPKE_STMT_TYPE_OID vs ATG_COSE_HPKE_STMT_TYPE_OID in cmpClient.c).
+ *
+ * |enc_private_key_pem| is a verifier P-256 HPKE recipient private key PEM; the
+ * Python helper derives its public key and encrypts to that public key.
+ *
+ * Output ownership: |*cmw_der_out| is OPENSSL_malloc'd and must be freed by the
+ * caller with OPENSSL_free().
+ */
+int eareat_cose_hpke_encrypt_ear(const char *enc_private_key_pem,
+                                 const unsigned char *ear, size_t ear_len,
+                                 unsigned char **cmw_der_out, size_t *cmw_der_len);
+
 # ifdef __cplusplus
 }
 # endif

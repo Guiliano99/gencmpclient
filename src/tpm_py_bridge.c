@@ -56,6 +56,8 @@ static PyObject *g_key_attest_func = NULL;
 static PyObject *g_build_chall_func = NULL;
 static PyObject *g_hpke_module = NULL;
 static PyObject *g_encrypt_ear_func = NULL;
+static PyObject *g_cose_hpke_module = NULL;
+static PyObject *g_encrypt_ear_cose_func = NULL;
 
 /* Lazily initialize the embedded interpreter and resolve
  * libattest.attester.evidence_bridge.generate_tpm_evidence once.  Idempotent;
@@ -138,6 +140,39 @@ static int ensure_hpke_ready(void)
         LOG_err("tpm_py_bridge: encrypt_ear_with_hpke not found/callable in "
                 "eareat_hpke_bridge");
         Py_CLEAR(g_encrypt_ear_func);
+        return 0;
+    }
+    return 1;
+}
+
+/* Resolve src/eareat_cose_hpke_bridge.py::encrypt_ear_with_cose_hpke. Same
+ * PYTHONPATH contract as ensure_hpke_ready(); a separate module so the JOSE
+ * and COSE HPKE paths (distinct AttestationStatement OIDs) resolve independent
+ * Python callables and neither needs the other's dependencies present. */
+static int ensure_cose_hpke_ready(void)
+{
+    if (g_encrypt_ear_cose_func != NULL)
+        return 1;
+
+    if (!Py_IsInitialized())
+        Py_Initialize();
+
+    if (g_cose_hpke_module == NULL) {
+        g_cose_hpke_module = PyImport_ImportModule("eareat_cose_hpke_bridge");
+        if (g_cose_hpke_module == NULL) {
+            PyErr_Print();
+            LOG_err("tpm_py_bridge: could not import eareat_cose_hpke_bridge — "
+                    "is gencmpclient/src on PYTHONPATH?");
+            return 0;
+        }
+    }
+
+    g_encrypt_ear_cose_func = PyObject_GetAttrString(g_cose_hpke_module, "encrypt_ear_with_cose_hpke");
+    if (g_encrypt_ear_cose_func == NULL || !PyCallable_Check(g_encrypt_ear_cose_func)) {
+        PyErr_Print();
+        LOG_err("tpm_py_bridge: encrypt_ear_with_cose_hpke not found/callable in "
+                "eareat_cose_hpke_bridge");
+        Py_CLEAR(g_encrypt_ear_cose_func);
         return 0;
     }
     return 1;
@@ -466,6 +501,64 @@ int eareat_hpke_encrypt_ear(const char *enc_private_key_pem,
     memcpy(*cmw_der_out, der_ptr, (size_t)der_len);
     *cmw_der_len = (size_t)der_len;
     LOG(FL_INFO, "tpm_py_bridge: encrypt_ear_with_hpke produced %zu-byte CMW DER",
+        *cmw_der_len);
+    ok = 1;
+
+done:
+    Py_DECREF(result);
+    if (!ok) {
+        OPENSSL_free(*cmw_der_out);
+        *cmw_der_out = NULL;
+        *cmw_der_len = 0;
+    }
+    return ok;
+}
+
+int eareat_cose_hpke_encrypt_ear(const char *enc_private_key_pem,
+                                 const unsigned char *ear, size_t ear_len,
+                                 unsigned char **cmw_der_out, size_t *cmw_der_len)
+{
+    PyObject *result = NULL;
+    const char *der_ptr = NULL;
+    Py_ssize_t der_len = 0;
+    int ok = 0;
+
+    if (enc_private_key_pem == NULL || ear == NULL || ear_len == 0
+            || cmw_der_out == NULL || cmw_der_len == NULL) {
+        LOG_err("tpm_py_bridge: invalid NULL/empty argument to eareat_cose_hpke_encrypt_ear");
+        return 0;
+    }
+    *cmw_der_out = NULL;
+    *cmw_der_len = 0;
+
+    if (!ensure_cose_hpke_ready())
+        return 0;
+
+    result = PyObject_CallFunction(g_encrypt_ear_cose_func, "sy#",
+                                   enc_private_key_pem,
+                                   (const char *)ear, (Py_ssize_t)ear_len);
+    if (result == NULL) {
+        log_python_error("encrypt_ear_with_cose_hpke call failed");
+        return 0;
+    }
+
+    if (!PyBytes_Check(result)) {
+        LOG_err("tpm_py_bridge: encrypt_ear_with_cose_hpke did not return bytes");
+        goto done;
+    }
+    if (PyBytes_AsStringAndSize(result, (char **)&der_ptr, &der_len) < 0) {
+        log_python_error("encrypt_ear_with_cose_hpke bytes extraction failed");
+        goto done;
+    }
+
+    *cmw_der_out = OPENSSL_malloc((size_t)der_len);
+    if (*cmw_der_out == NULL) {
+        LOG_err("tpm_py_bridge: OPENSSL_malloc failed for COSE-HPKE CMW DER");
+        goto done;
+    }
+    memcpy(*cmw_der_out, der_ptr, (size_t)der_len);
+    *cmw_der_len = (size_t)der_len;
+    LOG(FL_INFO, "tpm_py_bridge: encrypt_ear_with_cose_hpke produced %zu-byte CMW DER",
         *cmw_der_len);
     ok = 1;
 

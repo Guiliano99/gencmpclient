@@ -623,10 +623,19 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
 #ifdef USE_ATGLIB
 # define ATG_STMT_TYPE_OID "1.3.6.1.4.1.99999.1"
 # define ATG_HPKE_STMT_TYPE_OID "1.3.6.1.4.1.99999.10"
+/* COSE-HPKE (draft-ietf-cose-hpke) evidence encryption -- distinct OID from the
+ * JOSE-HPKE one above so a verifier can tell the two wire formats apart. */
+# define ATG_COSE_HPKE_STMT_TYPE_OID "1.3.6.1.4.1.99999.20"
 
 static const char *get_eareat_hpke_key_path(void)
 {
     const char *path = getenv("GENCMPCLIENT_HPKE_ENC_PRIVATE_KEY_PEM");
+    return (path != NULL && path[0] != '\0') ? path : NULL;
+}
+
+static const char *get_eareat_cose_hpke_key_path(void)
+{
+    const char *path = getenv("GENCMPCLIENT_COSE_HPKE_ENC_PRIVATE_KEY_PEM");
     return (path != NULL && path[0] != '\0') ? path : NULL;
 }
 #endif
@@ -1316,6 +1325,38 @@ static int generate_hpke_atg_evidence(struct token_req req,
     return 0;
 }
 
+static int generate_cose_hpke_atg_evidence(struct token_req req,
+                                           const char *enc_private_key_pem,
+                                           struct token_resp *resp,
+                                           unsigned char **cmw_der_out,
+                                           size_t *cmw_der_len)
+{
+    int atg_ret;
+
+    if (resp == NULL || cmw_der_out == NULL || cmw_der_len == NULL) {
+        LOG_err("generate_cose_hpke_atg_evidence: invalid NULL output argument");
+        return -1;
+    }
+    *cmw_der_out = NULL;
+    *cmw_der_len = 0;
+
+    atg_ret = atg_generate_evidence(req, resp);
+    if (atg_ret != 0)
+        return atg_ret;
+    if (resp->num_submods > 0) {
+        LOG_err("generate_cose_hpke_atg_evidence: submodules are not supported");
+        atg_free_attestation_token(*resp);
+        return -1;
+    }
+    if (!eareat_cose_hpke_encrypt_ear(enc_private_key_pem,
+                                      resp->token.buf, resp->token.buf_size,
+                                      cmw_der_out, cmw_der_len)) {
+        atg_free_attestation_token(*resp);
+        return -1;
+    }
+    return 0;
+}
+
 
 static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
                                            RATS_REQ *rats_config)
@@ -1330,6 +1371,8 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     ASN1_OCTET_STRING *token_os = NULL;
     ASN1_OCTET_STRING oct;
     const char *hpke_key_path = get_eareat_hpke_key_path();
+    const char *cose_hpke_key_path = get_eareat_cose_hpke_key_path();
+    const char *hpke_stmt_oid = NULL;
     struct token_req req;
     struct token_resp resp;
     LOCAL_ATT_STMT *stmt = NULL;
@@ -1351,9 +1394,14 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
     req.nonce_size = oct_nonce->length;
     req.user_data_size = 0;
 
-    if (hpke_key_path != NULL) {
+    if (cose_hpke_key_path != NULL) {
+        atg_ret = generate_cose_hpke_atg_evidence(req, cose_hpke_key_path, &resp,
+                                                  &hpke_cmw_der, &hpke_cmw_der_len);
+        hpke_stmt_oid = ATG_COSE_HPKE_STMT_TYPE_OID;
+    } else if (hpke_key_path != NULL) {
         atg_ret = generate_hpke_atg_evidence(req, hpke_key_path, &resp,
                                              &hpke_cmw_der, &hpke_cmw_der_len);
+        hpke_stmt_oid = ATG_HPKE_STMT_TYPE_OID;
     } else {
         atg_ret = atg_generate_evidence(req, &resp);
     }
@@ -1388,7 +1436,7 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
         goto err;
     /* Replace the default-initialised empty OID with the token-format OID. */
     ASN1_OBJECT_free(stmt->type);
-    stmt->type = OBJ_txt2obj(hpke_cmw_der != NULL ? ATG_HPKE_STMT_TYPE_OID : ATG_STMT_TYPE_OID,
+    stmt->type = OBJ_txt2obj(hpke_cmw_der != NULL ? hpke_stmt_oid : ATG_STMT_TYPE_OID,
                              1 /* dotted-decimal form */);
     if (stmt->type == NULL)
         goto err;
