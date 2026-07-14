@@ -196,6 +196,20 @@ bool opt_bad_tpmt_public;           /* inert in the platform-only profile */
 bool opt_bad_pbmac;                 /* inert in the platform-only profile */
 bool opt_bad_oaep;                  /* inert in the platform-only profile */
 
+/* Opt-in native TPM statement rendering.  LIBATTEST_LOG_STMT remains accepted
+ * for walkthrough compatibility, even though this branch's quote path is C/TSS2
+ * rather than an embedded-Python libattest bridge. */
+static int native_stmt_log_enabled(void)
+{
+    const char *value = getenv("CMP_LOG_ATTEST_STMT");
+
+    if (value == NULL || value[0] == '\0')
+        value = getenv("LIBATTEST_LOG_STMT");
+    return value != NULL && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0
+                             || strcmp(value, "TRUE") == 0 || strcmp(value, "yes") == 0
+                             || strcmp(value, "YES") == 0);
+}
+
 /* certificate enrollment and revocation */
 const char *opt_oldcert;
 long opt_revreason;
@@ -1196,6 +1210,11 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
         if (quote_stmt_der_len <= 0) {
             LOG_err("getTPMAttestExtNative: i2d_TCG_ATTEST_QUOTE failed");
             goto err;
+        }
+        if (native_stmt_log_enabled()) {
+            tpm_log_quote_statement(quote_attest_buf, quote_attest_len,
+                                    quote_sig_buf, quote_sig_len,
+                                    quote_pcr_vals_buf, quote_pcr_vals_len);
         }
 
         quote_stmt = LOCAL_ATT_STMT_new();

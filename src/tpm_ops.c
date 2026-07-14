@@ -621,6 +621,97 @@ done:
     return ok;
 }
 
+static void log_hex_field(const char *label, const unsigned char *value, size_t value_len)
+{
+    char *hex;
+
+    if (value == NULL && value_len != 0) {
+        LOG(FL_WARN, "tpm_ops: cannot render %s: NULL buffer with %zu bytes", label, value_len);
+        return;
+    }
+    if (value_len == 0) {
+        LOG(FL_INFO, "    %s (0 bytes): <empty>", label);
+        return;
+    }
+    hex = OPENSSL_buf2hexstr(value, value_len);
+    if (hex == NULL) {
+        LOG(FL_WARN, "tpm_ops: cannot render %s as hex", label);
+        return;
+    }
+    LOG(FL_INFO, "    %s (%zu bytes): %s", label, value_len, hex);
+    OPENSSL_free(hex);
+}
+
+static void log_pcr_selection(const TPML_PCR_SELECTION *selection)
+{
+    UINT32 bank;
+
+    for (bank = 0; bank < selection->count; bank++) {
+        const TPMS_PCR_SELECTION *current = &selection->pcrSelections[bank];
+
+        LOG(FL_INFO, "    pcrSelect[%u]: hashAlg=0x%04x", bank, current->hash);
+        log_hex_field("selection bitmap", current->pcrSelect, current->sizeofSelect);
+    }
+}
+
+void tpm_log_quote_statement(const unsigned char *attest, size_t attest_len,
+                             const unsigned char *signature, size_t signature_len,
+                             const unsigned char *pcr_values, size_t pcr_values_len)
+{
+    TPMS_ATTEST decoded_attest = { 0 };
+    TPMT_SIGNATURE decoded_signature = { 0 };
+    size_t offset = 0;
+    TSS2_RC rc;
+
+    if (attest == NULL || signature == NULL) {
+        LOG_err("tpm_ops: cannot render TcgAttestQuote with missing TPM evidence");
+        return;
+    }
+
+    rc = Tss2_MU_TPMS_ATTEST_Unmarshal(attest, attest_len, &offset, &decoded_attest);
+    if (rc != TSS2_RC_SUCCESS || offset != attest_len) {
+        LOG(FL_WARN, "tpm_ops: cannot decode TcgAttestQuote.tpmSAttest: %s",
+            Tss2_RC_Decode(rc));
+        return;
+    }
+
+    LOG(FL_INFO, "Generated TcgAttestQuote (OID 2.23.133.20.2):");
+    LOG(FL_INFO, "  tpmSAttest:");
+    LOG(FL_INFO, "    magic=0x%08x, type=0x%04x", decoded_attest.magic,
+        decoded_attest.type);
+    log_hex_field("qualifiedSigner", decoded_attest.qualifiedSigner.name,
+                  decoded_attest.qualifiedSigner.size);
+    log_hex_field("extraData (server-issued nonce)", decoded_attest.extraData.buffer,
+                  decoded_attest.extraData.size);
+
+    if (decoded_attest.type == TPM2_ST_ATTEST_QUOTE) {
+        log_pcr_selection(&decoded_attest.attested.quote.pcrSelect);
+        log_hex_field("pcrDigest", decoded_attest.attested.quote.pcrDigest.buffer,
+                      decoded_attest.attested.quote.pcrDigest.size);
+    } else {
+        LOG(FL_WARN, "  expected TPM2_ST_ATTEST_QUOTE, received type=0x%04x",
+            decoded_attest.type);
+    }
+
+    offset = 0;
+    rc = Tss2_MU_TPMT_SIGNATURE_Unmarshal(signature, signature_len, &offset,
+                                           &decoded_signature);
+    if (rc != TSS2_RC_SUCCESS || offset != signature_len) {
+        LOG(FL_WARN, "  signature: unable to decode TPMT_SIGNATURE: %s",
+            Tss2_RC_Decode(rc));
+    } else {
+        LOG(FL_INFO, "  signature: TPMT_SIGNATURE scheme=0x%04x (%zu bytes)",
+            decoded_signature.sigAlg, signature_len);
+    }
+    if (pcr_values == NULL && pcr_values_len != 0) {
+        LOG(FL_WARN, "  pcrValues: NULL buffer with %zu bytes", pcr_values_len);
+    } else {
+        LOG(FL_INFO,
+            "  pcrValues: %zu bytes (canonical concatenation of selected PCR values)",
+            pcr_values_len);
+    }
+}
+
 /*
  * tpm_rsa_oaep_decrypt — see tpm_ops.h for the contract.
  *
