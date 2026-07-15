@@ -603,6 +603,60 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
 #include "tpm_py_bridge.h"
 
 /*
+ * log_asn1_item - dump an ASN.1 value through LOG(), rendering every field
+ * from its ASN.1 template.
+ *
+ * ASN1_item_print() walks |it| and prints each field under its own name
+ * (optionals as <ABSENT>), so a structure gets a complete display without any
+ * hand-written per-field logging that could silently drift from the real
+ * ASN.1.  Mirrors the mem-BIO -> LOG idiom already used by save_template().
+ */
+static void log_asn1_item(severity level, const char *desc,
+                          const ASN1_ITEM *it, const void *val)
+{
+    BIO *mem;
+    const char *p;
+    long len;
+
+    if (val == NULL || (mem = BIO_new(BIO_s_mem())) == NULL)
+        return;
+    BIO_printf(mem, "%s:\n", desc);
+    ASN1_item_print(mem, (const ASN1_VALUE *)val, 2, it, NULL);
+    len = BIO_get_mem_data(mem, &p);
+    if (len > 0 && len <= INT_MAX)
+        LOG(LOG_FUNC_FILE_LINE, level, "%.*s", (int)len, p);
+    BIO_free(mem);
+}
+
+/*
+ * log_asn1_der - structurally dump a DER blob that has no local ASN.1 template.
+ *
+ * The TcgAttestQuote / TcgAttestCertify statement DER is minted by libattest-py
+ * and crosses tpm_py_bridge.c as opaque bytes, keeping that ASN.1 single-sourced
+ * in Python (see rats_csr_asn.h) -- so there is no ASN1_ITEM here to print field
+ * names from.  ASN1_parse_dump() still shows the full tag/length/value tree,
+ * i.e. the complete structure minus the field labels, without duplicating the
+ * Python schema in C.
+ */
+static void log_asn1_der(severity level, const char *desc,
+                         const unsigned char *der, size_t der_len)
+{
+    BIO *mem;
+    const char *p;
+    long len;
+
+    if (der == NULL || der_len == 0 || der_len > INT_MAX
+            || (mem = BIO_new(BIO_s_mem())) == NULL)
+        return;
+    BIO_printf(mem, "%s:\n", desc);
+    ASN1_parse_dump(mem, der, (long)der_len, 2, 0);
+    len = BIO_get_mem_data(mem, &p);
+    if (len > 0 && len <= INT_MAX)
+        LOG(LOG_FUNC_FILE_LINE, level, "%.*s", (int)len, p);
+    BIO_free(mem);
+}
+
+/*
  * OID: id-aa-attestation = 1.2.840.113549.1.9.16.2.59
  * Defined in draft-ietf-lamps-csr-attestation-24 §5 as { id-aa 59 }.
  *
@@ -705,6 +759,8 @@ static int build_tpm20_quote_req_info_der(unsigned int alg_id, unsigned char **o
         goto end;
     ha = NULL; /* ownership transferred to the stack */
 
+    log_asn1_item(LOG_INFO, "NonceRequest.reqInfo (TPM20QuoteReqInfo) being sent",
+                  ASN1_ITEM_rptr(TPM20_QUOTE_REQ_INFO), ri);
     len = i2d_TPM20_QUOTE_REQ_INFO(ri, out);
  end:
     ASN1_UTF8STRING_free(cn);
@@ -752,6 +808,10 @@ static int parse_tpm20_quote_resp_info_der(const unsigned char *der, long der_le
         LOG_err("TPM20QuoteRespInfo: DER did not decode");
         return 0;
     }
+    /* Print before the field checks below, so a structure that later fails
+     * validation is still shown in full rather than only named as bad. */
+    log_asn1_item(LOG_INFO, "NonceResponse.respInfo (TPM20QuoteRespInfo) from RA/CA",
+                  ASN1_ITEM_rptr(TPM20_QUOTE_RESP_INFO), ri);
     if (p != der + der_len) {
         LOG(FL_ERR, "TPM20QuoteRespInfo: trailing bytes after SEQUENCE "
                     "(consumed %ld of %ld)", (long)(p - der), der_len);
@@ -982,6 +1042,8 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
         }
         LOG(FL_INFO, "getTPMAttestExtNative: TPM2_Quote evidence: %zu-byte DER, "
                      "type OID %s", evidence_der_len, type_oid);
+        log_asn1_der(LOG_DEBUG, "TPM2_Quote evidence statement from libattest-py",
+                     evidence_der, evidence_der_len);
 
         quote_stmt = LOCAL_ATT_STMT_new();
         if (quote_stmt == NULL) goto err;
@@ -1902,6 +1964,11 @@ static OSSL_CMP_MSG *read_write_req_resp(OSSL_CMP_CTX *ctx,
     OSSL_CMP_PKIHEADER *hdr;
     const char *prev_opt_rspin = opt_rspin;
 
+    /* Complete decoded dump of every message sent/received (genm/genp included).
+     * At DEBUG so it stays out of the way until asked for via -verbosity 7. */
+    log_asn1_item(LOG_DEBUG, "CMP request being sent",
+                  ASN1_ITEM_rptr(OSSL_CMP_MSG), req);
+
     if (opt_reqout_only != NULL) {
         if (write_PKIMESSAGE(req, &opt_reqout_only))
             reqout_only_done = 1;
@@ -1945,6 +2012,9 @@ static OSSL_CMP_MSG *read_write_req_resp(OSSL_CMP_CTX *ctx,
     }
     if (res == NULL)
         goto err;
+
+    log_asn1_item(LOG_DEBUG, "CMP response received",
+                  ASN1_ITEM_rptr(OSSL_CMP_MSG), res);
 
     if (req_new != NULL || prev_opt_rspin != NULL) {
         /* need to satisfy nonce and transactionID checks by client */
