@@ -2386,6 +2386,23 @@ static int setup_ctx(CMP_CTX *ctx)
             LOG(FL_INFO, "Configured TPM NonceRequest: type=%s (%s reqInfo, %zuB)",
                 reqinfo_oid,
                 is_certify ? "KeyAttestChall" : "TPM20QuoteReqInfo", reqinfo_len);
+
+            if (!is_certify) {
+                /* Quote profile: the response answers under a DIFFERENT OID
+                 * than the request (distinct wire positions). The key-attest
+                 * leg answers under the SAME OID it was asked under, so it
+                 * needs no override — OpenSSL's default (request type) is
+                 * already correct for it. */
+                const char *resp_oid = get_tpm_quote_resp_oid();
+
+                if (!OSSL_CMP_CTX_set1_rats_expected_resp_type(ctx, resp_oid)) {
+                    LOG_err("Failed to set expected TPM quote NonceResponse "
+                            "type in CMP context");
+                    goto err;
+                }
+                LOG(FL_INFO, "Expecting TPM quote NonceResponse: type=%s",
+                    resp_oid);
+            }
         }
     }
 

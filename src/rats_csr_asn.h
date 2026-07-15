@@ -104,22 +104,27 @@ DECLARE_ASN1_FUNCTIONS(LOCAL_KEY_POP_PROOF)
 /* ── TPM 2.0 quote freshness open types (attestation-freshness draft) ────────
  *
  *   TPM20QuoteReqInfo ::= SEQUENCE {         -- attester → RA (NonceRequest.reqInfo)
- *       certificateName   SEQUENCE OF UTF8String OPTIONAL,   -- candidate AK certs
- *       supportedHashAlgo SEQUENCE OF TPMAlgId    OPTIONAL }  -- proposed banks
+ *       certificateName   [0] SEQUENCE OF UTF8String OPTIONAL,   -- candidate AK certs
+ *       supportedHashAlgo [1] SEQUENCE OF TPMAlgId    OPTIONAL }  -- proposed banks
  *   TPM20QuoteRespInfo ::= SEQUENCE {        -- RA → attester (NonceResponse.respInfo)
  *       certificateName UTF8String         OPTIONAL,  -- RA-selected AK cert
  *       pcrSelection    SEQUENCE OF PCRIndex,         -- MANDATORY, RA-mandated PCRs
  *       hashAlgo        TPMAlgId }                     -- MANDATORY, selected bank
  *
  * TPMAlgId 1..65535 (SHA-256=11), PCRIndex 0..23 — ranges checked in code.
- * Req fields are untagged SEQUENCE OF (libattest UpdateV8 wire format): a lone
- * one is ambiguous, so do NOT add [0]/[1] tags without matching libattest + the
- * Python decoder.  The client only ENCODES the req (both present → moot) and
- * DECODES the resp (distinct tags → unambiguous).  Replaces TpmAttestationParams.
+ * Req fields are IMPLICIT [0]/[1] tagged (ASN1_IMP_SEQUENCE_OF_OPT in
+ * rats_csr_asn.c): without a distinguishing tag both OPTIONAL fields would
+ * carry the same universal SEQUENCE OF tag and a lone one would be ambiguous.
+ * MUST match libattest's TPM20QuoteReqInfoASN1 (quote_profile.py) tag-for-tag —
+ * a one-sided retag previously broke every real genm capture (see the "Revert
+ * TPM20QuoteReqInfo to universal tags for C-wire interop" libattest commit).
+ * Resp fields need no tagging (certificateName is a plain UTF8String, not a
+ * SEQUENCE OF; the other two are mandatory) and stay untagged.
+ * Replaces TpmAttestationParams.
  */
 typedef struct tpm20_quote_req_info_st {
-    STACK_OF(ASN1_UTF8STRING) *certificateName;   /* SEQUENCE OF UTF8String OPTIONAL */
-    STACK_OF(ASN1_INTEGER)    *supportedHashAlgo; /* SEQUENCE OF TPMAlgId    OPTIONAL */
+    STACK_OF(ASN1_UTF8STRING) *certificateName;   /* [0] SEQUENCE OF UTF8String OPTIONAL */
+    STACK_OF(ASN1_INTEGER)    *supportedHashAlgo; /* [1] SEQUENCE OF TPMAlgId    OPTIONAL */
 } TPM20_QUOTE_REQ_INFO;
 
 DECLARE_ASN1_FUNCTIONS(TPM20_QUOTE_REQ_INFO)

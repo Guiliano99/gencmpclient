@@ -48,17 +48,22 @@ IMPLEMENT_ASN1_FUNCTIONS(LOCAL_KEY_POP_CHALLENGE)
 /* ── TPM 2.0 quote freshness open types (attestation-freshness draft) ────────
  *
  *   TPM20QuoteReqInfo ::= SEQUENCE {
- *       certificateName   SEQUENCE OF UTF8String OPTIONAL,
- *       supportedHashAlgo SEQUENCE OF TPMAlgId    OPTIONAL }
+ *       certificateName   [0] SEQUENCE OF UTF8String OPTIONAL,
+ *       supportedHashAlgo [1] SEQUENCE OF TPMAlgId    OPTIONAL }
  *   TPM20QuoteRespInfo ::= SEQUENCE {
  *       certificateName UTF8String         OPTIONAL,
  *       pcrSelection    SEQUENCE OF PCRIndex,   -- MANDATORY
  *       hashAlgo        TPMAlgId }              -- MANDATORY
  *
- * See rats_csr_asn.h for the untagged-SEQUENCE-OF wire caveat and value ranges. */
+ * TPM20QuoteReqInfo's two OPTIONAL fields are IMPLICIT [0]/[1] tagged so they
+ * decode unambiguously (without a distinguishing tag both would carry the same
+ * universal SEQUENCE OF tag). MUST match libattest's TPM20QuoteReqInfoASN1
+ * (quote_profile.py) tag-for-tag — see rats_csr_asn.h. TPM20QuoteRespInfo's
+ * fields need no tagging: certificateName is a plain UTF8String (not a
+ * SEQUENCE OF) and the other two are mandatory, so it stays untagged. */
 ASN1_SEQUENCE(TPM20_QUOTE_REQ_INFO) = {
-    ASN1_SEQUENCE_OF_OPT(TPM20_QUOTE_REQ_INFO, certificateName,   ASN1_UTF8STRING),
-    ASN1_SEQUENCE_OF_OPT(TPM20_QUOTE_REQ_INFO, supportedHashAlgo, ASN1_INTEGER),
+    ASN1_IMP_SEQUENCE_OF_OPT(TPM20_QUOTE_REQ_INFO, certificateName,   ASN1_UTF8STRING, 0),
+    ASN1_IMP_SEQUENCE_OF_OPT(TPM20_QUOTE_REQ_INFO, supportedHashAlgo, ASN1_INTEGER,    1),
 } ASN1_SEQUENCE_END(TPM20_QUOTE_REQ_INFO)
 IMPLEMENT_ASN1_FUNCTIONS(TPM20_QUOTE_REQ_INFO)
 
