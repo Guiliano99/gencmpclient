@@ -727,29 +727,36 @@ static const char *get_tpm_key_attest_oid(void)
 }
 
 /*
- * Build DER(TPM20QuoteReqInfo{certificateName=["ak"], supportedHashAlgo=[alg_id]})
- * for NonceRequest.reqInfo: fixed demo AK label + single proposed hash bank (the
- * RA/CA selects the PCRs + bank).  Returns DER length and sets *out (caller frees
- * with OPENSSL_free), <= 0 on error.  The CMP layer carries reqInfo as opaque ANY.
+ * Build DER(TPM20QuoteReqInfo{certificateName=["ak", "ak-2", "ak-3"],
+ * supportedHashAlgo=[alg_id]}) for NonceRequest.reqInfo. The labels are candidate
+ * certificate names; the RA/CA selects the PCRs + bank. Returns DER length and sets
+ * *out (caller frees with OPENSSL_free), <= 0 on error. The CMP layer carries reqInfo
+ * as opaque ANY.
  */
 static int build_tpm20_quote_req_info_der(unsigned int alg_id, unsigned char **out)
 {
+    static const char *const certificate_names[] = { "ak", "ak-2", "ak-3" };
     TPM20_QUOTE_REQ_INFO *ri = TPM20_QUOTE_REQ_INFO_new();
     ASN1_UTF8STRING *cn = NULL;
     ASN1_INTEGER *ha = NULL;
+    size_t index;
     int len = -1;
 
     *out = NULL;
     if (ri == NULL)
         goto end;
 
-    /* certificateName = [ "ak" ] — fixed demo AK label (single AK, no selection) */
-    if ((ri->certificateName = sk_ASN1_UTF8STRING_new_null()) == NULL
-            || (cn = ASN1_UTF8STRING_new()) == NULL
-            || !ASN1_STRING_set(cn, "ak", 2)
-            || !sk_ASN1_UTF8STRING_push(ri->certificateName, cn))
+    /* Candidate certificate-name labels; they do not select TPM handles. */
+    if ((ri->certificateName = sk_ASN1_UTF8STRING_new_null()) == NULL)
         goto end;
-    cn = NULL; /* ownership transferred to the stack */
+    for (index = 0; index < sizeof(certificate_names) / sizeof(certificate_names[0]); index++) {
+        if ((cn = ASN1_UTF8STRING_new()) == NULL
+                || !ASN1_STRING_set(cn, certificate_names[index],
+                                    (int)strlen(certificate_names[index]))
+                || !sk_ASN1_UTF8STRING_push(ri->certificateName, cn))
+            goto end;
+        cn = NULL; /* ownership transferred to the stack */
+    }
 
     /* supportedHashAlgo = [ alg_id ] — single proposed hash bank */
     if ((ri->supportedHashAlgo = sk_ASN1_INTEGER_new_null()) == NULL
