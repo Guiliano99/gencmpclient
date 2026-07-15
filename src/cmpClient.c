@@ -1042,7 +1042,7 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
         }
         LOG(FL_INFO, "getTPMAttestExtNative: TPM2_Quote evidence: %zu-byte DER, "
                      "type OID %s", evidence_der_len, type_oid);
-        log_asn1_der(LOG_DEBUG, "TPM2_Quote evidence statement from libattest-py",
+        log_asn1_der(LOG_INFO, "TPM2_Quote evidence statement from libattest-py",
                      evidence_der, evidence_der_len);
 
         quote_stmt = LOCAL_ATT_STMT_new();
@@ -1965,8 +1965,11 @@ static OSSL_CMP_MSG *read_write_req_resp(OSSL_CMP_CTX *ctx,
     const char *prev_opt_rspin = opt_rspin;
 
     /* Complete decoded dump of every message sent/received (genm/genp included).
-     * At DEBUG so it stays out of the way until asked for via -verbosity 7. */
-    log_asn1_item(LOG_DEBUG, "CMP request being sent",
+     * At INFO, not DEBUG: libsecutils compiles DEBUG-level output out entirely
+     * under NDEBUG (see log.c "output DEBUG level messages only if debugging is
+     * enabled at build time"), which would silently drop these dumps from a
+     * release build.  Lower -verbosity to 5 (NOTICE) to mute them. */
+    log_asn1_item(LOG_INFO, "CMP request being sent",
                   ASN1_ITEM_rptr(OSSL_CMP_MSG), req);
 
     if (opt_reqout_only != NULL) {
@@ -2013,7 +2016,7 @@ static OSSL_CMP_MSG *read_write_req_resp(OSSL_CMP_CTX *ctx,
     if (res == NULL)
         goto err;
 
-    log_asn1_item(LOG_DEBUG, "CMP response received",
+    log_asn1_item(LOG_INFO, "CMP response received",
                   ASN1_ITEM_rptr(OSSL_CMP_MSG), res);
 
     if (req_new != NULL || prev_opt_rspin != NULL) {
