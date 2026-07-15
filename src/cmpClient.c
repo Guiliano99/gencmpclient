@@ -695,21 +695,37 @@ static const char *get_eareat_cose_hpke_key_path(void)
 #endif
 
 /*
- * TPM PCR-selection / quote-parameter type OID.
+ * TPM PCR-selection / quote-parameter type OIDs.
  *
- * Per the attestation-freshness draft, the RA/CA returns
- * NonceResponse{type=this OID, respInfo=DER(TPM20QuoteRespInfo)}.  The
- * attester checks the response type, decodes respInfo as
- * TPM20QuoteRespInfo, and quotes those PCRs using the negotiated hash
+ * Per the attestation-freshness draft the request and the response are distinct
+ * wire positions and carry DISTINCT type OIDs: the attester sends
+ * NonceRequest{type=<req OID>, reqInfo=DER(TPM20QuoteReqInfo)} and the RA/CA
+ * answers NonceResponse{type=<res OID>, respInfo=DER(TPM20QuoteRespInfo)}.  The
+ * attester checks the response type against the RESPONSE OID, decodes respInfo
+ * as TPM20QuoteRespInfo, and quotes those PCRs using the negotiated hash
  * algorithm.
+ *
+ * The values must match libattest's id_tpm20_quote_req / id_tpm20_quote_res
+ * (libattest/formats/tpm/quote_profile.py) and the end-to-end example messages.
+ * Both sides read the same env vars, so a deployment retargets them in lockstep.
  */
-#define TPM_PCR_SELECTION_OID_DEFAULT "1.3.6.1.4.1.99999.3"
+#define TPM_PCR_SELECTION_OID_DEFAULT "1.2.3.4.5"
+#define TPM_QUOTE_RESP_OID_DEFAULT "1.2.3.4.6"
 
 static const char *get_tpm_pcr_selection_oid(void)
 {
     const char *env = getenv("TPM_PCR_SELECTION_OID");
     return (env != NULL && env[0] != '\0')
            ? env : TPM_PCR_SELECTION_OID_DEFAULT;
+}
+
+/* NonceResponse type OID for the TPM 2.0 quote profile.  Differs from the
+ * request OID above: respTypeInfo.type selects the respInfo syntax. */
+static const char *get_tpm_quote_resp_oid(void)
+{
+    const char *env = getenv("TPM_QUOTE_RESP_OID");
+    return (env != NULL && env[0] != '\0')
+           ? env : TPM_QUOTE_RESP_OID_DEFAULT;
 }
 
 /* NonceRequest request-type OID for the v5 key-attestation profile.
@@ -867,7 +883,9 @@ static int parse_tpm20_quote_resp_info_der(const unsigned char *der, long der_le
  * extract_tpm20_quote_resp_info
  * ------------------------------
  * Read NonceResponse.respInfo off the CTX, require NonceResponse.type ==
- * TPM_PCR_SELECTION_OID, and decode respInfo as a TPM20QuoteRespInfo.
+ * TPM_QUOTE_RESP_OID, and decode respInfo as a TPM20QuoteRespInfo.  Note this is
+ * the RESPONSE OID, not the request's TPM_PCR_SELECTION_OID: respTypeInfo.type
+ * selects the respInfo syntax and is a different wire position than the request.
  * Returns: 1 = success (out_count > 0, out_hash_alg_id set); 0 = no type/respInfo
  * at all (caller may use defaults); -1 = present but unusable.  Callers MUST treat
  * -1 as fatal — quoting defaults the RA/CA did not select bypasses its PCR policy.
@@ -880,7 +898,7 @@ static int extract_tpm20_quote_resp_info(OSSL_CMP_CTX *ctx,
 {
     const ASN1_OBJECT *type_obj = OSSL_CMP_CTX_get0_rats_resp_type(ctx);
     const ASN1_TYPE *resp_info = OSSL_CMP_CTX_get0_rats_resp_info(ctx);
-    const char *target_oid = get_tpm_pcr_selection_oid();
+    const char *target_oid = get_tpm_quote_resp_oid();
     char type_oid[64] = {0};
     unsigned char *full = NULL;
     int full_len, ok;
