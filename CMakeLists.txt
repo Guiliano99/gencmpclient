@@ -134,8 +134,8 @@ else()
   if(UNIX AND NOT APPLE)
     set(COVERAGE_FLAGS --coverage -fprofile-arcs)
     add_compile_options(${COVERAGE_FLAGS})
+    # applies to all targets created below, incl. ${LIBGENCMP_NAME} and cmpClient
     link_libraries(${COVERAGE_FLAGS})
-    target_link_libraries(${LIBGENCMP_NAME} ${COVERAGE_FLAGS})
   endif()
 endif()
 message(STATUS "build mode: ${CMAKE_BUILD_TYPE}")
@@ -156,10 +156,22 @@ add_compile_options(-Wno-sign-conversion -Wno-shorten-64-to-32 -Wno-shadow)
 # target_compile_features(${LIBGENCMP_NAME} PRIVATE c_std_90)
 # target_compile_features(cmpClient         PRIVATE c_std_90)
 
+# Embedded Python for ${SRC_DIR}/tpm_py_bridge.c: TPM evidence generation runs
+# in libattest-py via an embedded interpreter (see src/tpm_py_bridge.h), so the
+# library needs libpython.  Makefile_src does the same via
+# `python3-config --ldflags --embed`.
+find_package(Python3 COMPONENTS Development.Embed REQUIRED)
+
+# Source list mirrors Makefile_src's OBJS/OUTLIBV split: rats_csr_asn.c and
+# tpm_py_bridge.c belong to the library, cmpClient.c is only the executable.
 add_library(${LIBGENCMP_NAME} SHARED
   "${PROJECT_SOURCE_DIR}/.github/workflows/build.yml"
   ${SRC_DIR}/genericCMPClient.c
+  ${SRC_DIR}/rats_csr_asn.c
+  ${SRC_DIR}/tpm_py_bridge.c
 )
+
+target_link_libraries(${LIBGENCMP_NAME} Python3::Python)
 
 add_executable(cmpClient
   ${SRC_DIR}/cmpClient.c
