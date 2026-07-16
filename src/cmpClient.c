@@ -743,7 +743,7 @@ static const char *get_tpm_key_attest_oid(void)
 }
 
 /*
- * Build DER(TPM20QuoteReqInfo{certificateName=["ak", "ak-2", "ak-3"],
+ * Build DER(TPM20QuoteReqInfo{certificateName=["ak-1", "ak-2", "ak-3"],
  * supportedHashAlgo=[alg_id]}) for NonceRequest.reqInfo. The labels are candidate
  * certificate names; the RA/CA selects the PCRs + bank. Returns DER length and sets
  * *out (caller frees with OPENSSL_free), <= 0 on error. The CMP layer carries reqInfo
@@ -751,7 +751,7 @@ static const char *get_tpm_key_attest_oid(void)
  */
 static int build_tpm20_quote_req_info_der(unsigned int alg_id, unsigned char **out)
 {
-    static const char *const certificate_names[] = { "ak", "ak-2", "ak-3" };
+    static const char *const certificate_names[] = { "ak-1", "ak-2", "ak-3" };
     TPM20_QUOTE_REQ_INFO *ri = TPM20_QUOTE_REQ_INFO_new();
     ASN1_UTF8STRING *cn = NULL;
     ASN1_INTEGER *ha = NULL;
