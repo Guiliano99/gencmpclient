@@ -629,6 +629,32 @@ static void log_asn1_item(severity level, const char *desc,
 }
 
 /*
+ * format_pcr_list - render a PCR index array as "0,1,2,3,4" into |buf|.
+ *
+ * Complements log_asn1_item(), which already dumps the full respInfo
+ * structure field-by-field: this gives the parsed unsigned-int selection a
+ * single compact line for the summary log, instead of only reporting a
+ * count. Operates on the already-decoded array, not the ASN.1 item, so it
+ * carries no template-drift risk. Truncates safely if |buf| is too small.
+ */
+static void format_pcr_list(const unsigned int *pcrs, size_t count,
+                            char *buf, size_t buf_size)
+{
+    size_t i, off = 0;
+
+    if (buf_size == 0)
+        return;
+    buf[0] = '\0';
+    for (i = 0; i < count && off < buf_size; i++) {
+        int n = snprintf(buf + off, buf_size - off, "%s%u",
+                         i ? "," : "", pcrs[i]);
+        if (n < 0)
+            break;
+        off += (size_t)n;
+    }
+}
+
+/*
  * log_asn1_der - structurally dump a DER blob that has no local ASN.1 template.
  *
  * The TcgAttestQuote / TcgAttestCertify statement DER is minted by libattest-py
@@ -1031,9 +1057,13 @@ static X509_EXTENSIONS *getTPMAttestExtNative(OSSL_CMP_CTX *ctx,
             goto err;
         }
         if (params_rc == 1) {
+            char pcr_list[24 * 3]; /* "23," worst case per PCR, 24 PCRs max */
+
+            format_pcr_list(verifier_pcrs, verifier_pcr_count,
+                            pcr_list, sizeof(pcr_list));
             LOG(FL_INFO, "getTPMAttestExtNative: using verifier-supplied PCR "
-                         "selection from NonceResponse.respInfo (%zu PCR(s))",
-                verifier_pcr_count);
+                         "selection from NonceResponse.respInfo (%zu PCR(s)): [%s]",
+                verifier_pcr_count, pcr_list);
             if (verifier_pcr_count > 0) {
                 pcr_arg      = verifier_pcrs;
                 pcr_arg_count = verifier_pcr_count;
