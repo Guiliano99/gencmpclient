@@ -207,7 +207,22 @@ else
     override CFLAGS += -D_FORTIFY_SOURCE=2
 endif
 
-OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ)
+# Opt-in in-process xclaim-CWT + COSE-HPKE-0 evidence (src/cwt_cmd.c, src/cose_hpke0.c):
+#   make -f Makefile_v1 build_only USE_XCLAIM_HPKE=1 QCBOR_INC=<dir containing qcbor/> QCBOR_LIB=<dir containing libqcbor.a>
+# The objects go into libgencmp (cmpClient links -lgencmp); unset => nothing changes.
+ifdef USE_XCLAIM_HPKE
+    override CFLAGS += -DUSE_XCLAIM_HPKE
+    ifneq ($(QCBOR_INC),)
+        override CFLAGS += -isystem $(QCBOR_INC)
+    endif
+    ifneq ($(QCBOR_LIB),)
+        override LDFLAGS += -L $(QCBOR_LIB)
+    endif
+    override LIBS += -lqcbor -lm
+    XCLAIM_OBJS = src/cwt_cmd$(OBJ) src/cose_hpke0$(OBJ)
+endif
+
+OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ) $(XCLAIM_OBJS)
 
 SRCS = $(OBJS:$(OBJ)=.c)
 
@@ -259,7 +274,7 @@ $(OUT_DIR)/$(OUTLIBV): | clean_libcmp_a
 $(OUT_DIR)/$(OUTLIBV): $(OUT_DIR)/$(LIBCMP_A)
    endif
 endif
-$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ)
+$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ) $(XCLAIM_OBJS)
 	$(CC) $^ $(LDFLAGS) $(LIBS) -shared -o $@ -Wl,-$(SONAME)$(OUTLIBV)
 
 $(OUT_DIR)/$(OUTLIB): $(OUT_DIR)/$(OUTLIBV)

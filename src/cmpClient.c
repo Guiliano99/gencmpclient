@@ -601,6 +601,10 @@ static int SSL_CTX_add_extra_chain_free(SSL_CTX *ssl_ctx, STACK_OF(X509) *certs)
  */
 #include "rats_csr_asn.h"
 #include "tpm_py_bridge.h"
+#ifdef USE_XCLAIM_HPKE
+# include "cwt_cmd.h"
+# include "cose_hpke0.h"
+#endif
 
 /*
  * log_asn1_item - dump an ASN.1 value through LOG(), rendering every field
@@ -717,6 +721,42 @@ static const char *get_eareat_cose_hpke_key_path(void)
 {
     const char *path = getenv("GENCMPCLIENT_COSE_HPKE_ENC_PRIVATE_KEY_PEM");
     return (path != NULL && path[0] != '\0') ? path : NULL;
+}
+#endif
+
+#ifdef USE_XCLAIM_HPKE
+/*
+ * In-process xclaim-CWT + COSE-HPKE-0 evidence (src/cwt_cmd.c, src/cose_hpke0.c).
+ * After the GenP, an external helper builds + signs the CWT around the server
+ * nonce (xclaim), then the CWT is sealed to the Verifier's pinned HPKE key.
+ * Own statement OID: the CWT uses RFC 9711 integer claim labels, unlike
+ * ATG_COSE_HPKE_STMT_TYPE_OID's string-keyed claims. The NonceRequest carries
+ * the same OID as its type, so the RA/CA stores the nonce under it.
+ */
+# define XCLAIM_HPKE_STMT_TYPE_OID_DEFAULT "1.3.6.1.4.1.99999.21"
+
+static const char *getenv_nonempty(const char *name)
+{
+    const char *val = getenv(name);
+    return (val != NULL && val[0] != '\0') ? val : NULL;
+}
+
+static const char *get_xclaim_hpke_stmt_oid(void)
+{
+    const char *oid = getenv_nonempty("COSE_EVIDENCE_ENC_OID");
+    return oid != NULL ? oid : XCLAIM_HPKE_STMT_TYPE_OID_DEFAULT;
+}
+
+/* absolute path of the helper that runs xclaim: <helper> <nonce-hex> <out-file> */
+static const char *get_cwt_cmd(void)
+{
+    return getenv_nonempty("GENCMPCLIENT_CWT_CMD");
+}
+
+/* the Verifier's HPKE-0 public key (EC P-256 SubjectPublicKeyInfo PEM), pinned */
+static const char *get_cose_recipient_pem(void)
+{
+    return getenv_nonempty("GENCMPCLIENT_COSE_RECIPIENT_PEM");
 }
 #endif
 
@@ -1644,6 +1684,138 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
 }
 #endif /* USE_ATGLIB */
 
+#ifdef USE_XCLAIM_HPKE
+/*
+ * Wrap one evidence blob into AttestationStatement{type=stmt_oid, stmt=OCTET STRING}
+ * inside an AttestationBundle and return it as the id-aa-attestation extension.
+ * The OCTET STRING is the CMW `cbor` alternative (see cose_hpke0_cmw_record()).
+ */
+static X509_EXTENSIONS *build_attestation_ext(const char *stmt_oid,
+                                              const unsigned char *os_data,
+                                              size_t os_len)
+{
+    X509_EXTENSIONS *exts = NULL;
+    X509_EXTENSION *ext = NULL;
+    unsigned char *bundle_der = NULL;
+    ASN1_OCTET_STRING *token_os = NULL;
+    ASN1_OCTET_STRING oct;
+    LOCAL_ATT_STMT *stmt = NULL;
+    LOCAL_ATT_BUNDLE *bundle = NULL;
+    int bundle_der_len, att_nid, ret = 0;
+
+    stmt = LOCAL_ATT_STMT_new();
+    if (stmt == NULL)
+        goto err;
+    ASN1_OBJECT_free(stmt->type);
+    stmt->type = OBJ_txt2obj(stmt_oid, 1 /* dotted-decimal form */);
+    if (stmt->type == NULL) {
+        LOG(FL_ERR, "invalid statement OID '%s'", stmt_oid);
+        goto err;
+    }
+    token_os = ASN1_OCTET_STRING_new();
+    if (token_os == NULL
+            || !ASN1_OCTET_STRING_set(token_os, os_data, (int)os_len))
+        goto err;
+    ASN1_TYPE_set(stmt->stmt, V_ASN1_OCTET_STRING, token_os);
+    token_os = NULL; /* ownership transferred to stmt->stmt */
+
+    bundle = LOCAL_ATT_BUNDLE_new();
+    if (bundle == NULL)
+        goto err;
+    if (bundle->attestations == NULL) {
+        bundle->attestations = sk_LOCAL_ATT_STMT_new_null();
+        if (bundle->attestations == NULL)
+            goto err;
+    }
+    if (!sk_LOCAL_ATT_STMT_push(bundle->attestations, stmt))
+        goto err;
+    stmt = NULL; /* ownership transferred to bundle */
+
+    bundle_der_len = i2d_LOCAL_ATT_BUNDLE(bundle, &bundle_der);
+    if (bundle_der_len < 0)
+        goto err;
+    oct.data = bundle_der;
+    oct.length = bundle_der_len;
+    oct.flags = 0;
+
+    /* registered at runtime so this works whatever the OpenSSL headers define */
+    att_nid = OBJ_txt2nid(ID_AA_ATTESTATION_OID);
+    if (att_nid == NID_undef)
+        att_nid = OBJ_create(ID_AA_ATTESTATION_OID,
+                             "id-aa-attestation", "id-aa-attestation");
+    if (att_nid == NID_undef) {
+        LOG_err("Failed to register id-aa-attestation OID");
+        goto err;
+    }
+    ext = X509_EXTENSION_create_by_NID(NULL, att_nid, 0 /* not critical */, &oct);
+    if (ext == NULL
+            || (exts = sk_X509_EXTENSION_new_null()) == NULL
+            || !sk_X509_EXTENSION_push(exts, ext))
+        goto err;
+    ret = 1;
+
+ err:
+    ASN1_OCTET_STRING_free(token_os);
+    LOCAL_ATT_STMT_free(stmt);
+    LOCAL_ATT_BUNDLE_free(bundle);
+    OPENSSL_free(bundle_der);
+    if (ret == 0) {
+        X509_EXTENSION_free(ext);
+        sk_X509_EXTENSION_free(exts);
+        exts = NULL;
+    }
+    return exts;
+}
+
+/*
+ * Evidence = COSE-HPKE-0 COSE_Encrypt0 over the xclaim-signed CWT, as a CMW CBOR
+ * record. The nonce (OSSL_CMP_CTX_get0_rats_nonce) only reaches the signed claims;
+ * it is never set or supplied by the client side (CLAUDE.md hard rule 4).
+ */
+static X509_EXTENSIONS *getXclaimHpkeExt(OSSL_CMP_CTX *ctx)
+{
+    X509_EXTENSIONS *exts = NULL;
+    const ASN1_OCTET_STRING *oct_nonce = OSSL_CMP_CTX_get0_rats_nonce(ctx);
+    const char *cmd = get_cwt_cmd();
+    const char *recipient_pem = get_cose_recipient_pem();
+    EVP_PKEY *recipient = NULL;
+    unsigned char *cwt = NULL, *cose = NULL, *record = NULL;
+    size_t cwt_len = 0, cose_len = 0, record_len = 0, i;
+
+    if (cmd == NULL || recipient_pem == NULL) {
+        LOG_err("GENCMPCLIENT_CWT_CMD and GENCMPCLIENT_COSE_RECIPIENT_PEM must be set");
+        goto err;
+    }
+    if (oct_nonce == NULL) {
+        LOG_err("Error: No nonce available for remote attestation");
+        goto err;
+    }
+    printf("RATS nonce: ");
+    for (i = 0; i < (size_t)oct_nonce->length; i++)
+        printf("%02x", oct_nonce->data[i]);
+    printf("\n");
+
+    if (!cose_hpke0_load_recipient(recipient_pem, &recipient)
+            || !cwt_cmd_run(cmd, oct_nonce->data, (size_t)oct_nonce->length,
+                            &cwt, &cwt_len)
+            || !cose_hpke0_seal_encrypt0(cwt, cwt_len, recipient, &cose, &cose_len)
+            || !cose_hpke0_cmw_record(cose, cose_len, &record, &record_len)) {
+        LOG_err("Failed to build the xclaim COSE-HPKE evidence");
+        goto err;
+    }
+    printf("CWT size: %zu\n", cwt_len);
+    printf("XCLAIM HPKE CMW record size: %zu\n", record_len);
+    exts = build_attestation_ext(get_xclaim_hpke_stmt_oid(), record, record_len);
+
+ err:
+    EVP_PKEY_free(recipient);
+    free(cwt);
+    free(cose);
+    free(record);
+    return exts;
+}
+#endif /* USE_XCLAIM_HPKE */
+
 static int add_rats_extensions(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config, X509_EXTENSIONS **exts)
 {
     X509_EXTENSIONS *rats_exts = NULL;
@@ -1697,7 +1869,16 @@ static int add_rats_extensions(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config, X509_EX
                                               opt_bad_attest_sig);
         }
     }
-#ifdef USE_ATGLIB
+#if defined(USE_XCLAIM_HPKE) && defined(USE_ATGLIB)
+# error "USE_XCLAIM_HPKE and USE_ATGLIB select different -rats evidence paths; build with one of them"
+#endif
+#ifdef USE_XCLAIM_HPKE
+    /* xclaim CWT + in-process COSE-HPKE-0 evidence. */
+    else {
+        (void)rats_config;
+        rats_exts = getXclaimHpkeExt(ctx);
+    }
+#elif defined(USE_ATGLIB)
     /* ATG library path: generate EAT token via libatg. */
     else {
         rats_exts = getattestationExt(ctx, rats_config);
@@ -2328,7 +2509,20 @@ static int setup_ctx(CMP_CTX *ctx)
         if (opt_tpm_ak_handle_str != NULL) {
             /* Native in-process TPM path — TPM2_Quote driven by -tpm_ak_handle.
              * No ATG library config needed. */
-        } else {
+        }
+#ifdef USE_XCLAIM_HPKE
+        else {
+            /* xclaim CWT + COSE-HPKE-0 path — no ATG token config; the helper
+             * and the Verifier's HPKE key come from the environment. Fail hard
+             * here rather than fall back to some other evidence path. */
+            if (get_cwt_cmd() == NULL || get_cose_recipient_pem() == NULL) {
+                LOG_err("-rats needs GENCMPCLIENT_CWT_CMD and "
+                        "GENCMPCLIENT_COSE_RECIPIENT_PEM in this build");
+                goto err;
+            }
+        }
+#else
+        else {
             /* ATG library path — token name + config files required. */
             if (opt_rats_tokenname == NULL
                 || opt_rats_tokencfgpath == NULL
@@ -2346,8 +2540,19 @@ static int setup_ctx(CMP_CTX *ctx)
             rats_config->tokencfgpath = opt_rats_tokencfgpath;
             rats_config->plugincfgpath = opt_rats_plugincfgpath;
         }
+#endif
         (void) OSSL_CMP_CTX_set_certreq_cb(ctx, CMPclient_app_cb);
         (void) OSSL_CMP_CTX_set_certreq_cb_arg(ctx, (void *)rats_config);
+#ifdef USE_XCLAIM_HPKE
+        /* Typed NonceRequest: the RA/CA stores the nonce under this OID, which is
+         * also the evidence statement type it later looks it up by. */
+        if (opt_tpm_ak_handle_str == NULL
+                && !OSSL_CMP_CTX_set1_rats_reqInfo(ctx, get_xclaim_hpke_stmt_oid(),
+                                                   NULL, 0)) {
+            LOG_err("Failed to set the xclaim NonceRequest type in CMP context");
+            goto err;
+        }
+#endif
         if (opt_tpm_subject_pub_der != NULL)
             LOG_warn("-tpm_subject_pub_der is ignored (reserved; native certify "
                      "uses -tpm_subject_pem)");
