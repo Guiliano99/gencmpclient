@@ -222,7 +222,7 @@ ifdef USE_XCLAIM_HPKE
     XCLAIM_OBJS = src/cwt_cmd$(OBJ) src/cose_hpke0$(OBJ)
 endif
 
-OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ) $(XCLAIM_OBJS)
+OBJS = src/genericCMPClient$(OBJ) src/cmpClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ) src/ext_attester$(OBJ) $(XCLAIM_OBJS)
 
 SRCS = $(OBJS:$(OBJ)=.c)
 
@@ -274,7 +274,7 @@ $(OUT_DIR)/$(OUTLIBV): | clean_libcmp_a
 $(OUT_DIR)/$(OUTLIBV): $(OUT_DIR)/$(LIBCMP_A)
    endif
 endif
-$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ) $(XCLAIM_OBJS)
+$(OUT_DIR)/$(OUTLIBV): src/genericCMPClient$(OBJ) src/rats_csr_asn$(OBJ) src/tpm_py_bridge$(OBJ) src/ext_attester$(OBJ) $(XCLAIM_OBJS)
 	$(CC) $^ $(LDFLAGS) $(LIBS) -shared -o $@ -Wl,-$(SONAME)$(OUTLIBV)
 
 $(OUT_DIR)/$(OUTLIB): $(OUT_DIR)/$(OUTLIBV)

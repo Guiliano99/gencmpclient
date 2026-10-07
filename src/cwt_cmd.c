@@ -7,6 +7,7 @@
 #endif
 
 #include "cwt_cmd.h"
+#include "ext_attester.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -95,124 +96,32 @@ static int cwt_cmd_check_cwt(const unsigned char *cwt, size_t len)
     return ok;
 }
 
-/* Run the helper; returns 1 iff it exited 0 within the timeout. */
-static int spawn_and_wait(const char *cmd, const char *hex, const char *path)
-{
-    char *argv[] = { (char *)cmd, (char *)hex, (char *)path, NULL };
-    struct timespec tick = { 0, 20L * 1000 * 1000 }; /* 20 ms */
-    int status = 0, waited_ms = 0;
-    pid_t done, pid = fork();
-
-    if (pid < 0) {
-        ERR("fork: %s", strerror(errno));
-        return 0;
-    }
-    if (pid == 0) {
-        int fd = open("/dev/null", O_RDONLY);
-
-        setpgid(0, 0); /* own group, so a timeout also kills e.g. xclaim */
-        if (fd >= 0)
-            dup2(fd, 0);
-        /* inherit only 0/1/2: no CMP socket, no temp-file descriptor */
-        if (close_range(3, ~0U, 0) != 0) {
-            long max = sysconf(_SC_OPEN_MAX);
-            for (fd = 3; fd < max && fd < 65536; fd++)
-                close(fd);
-        }
-        execv(cmd, argv);
-        _exit(127);
-    }
-    while ((done = waitpid(pid, &status, WNOHANG)) == 0) {
-        if (waited_ms >= CWT_CMD_TIMEOUT_S * 1000) {
-            ERR("helper timed out after %d s, killing it", CWT_CMD_TIMEOUT_S);
-            kill(-pid, SIGKILL);
-            waitpid(pid, &status, 0);
-            return 0;
-        }
-        nanosleep(&tick, NULL);
-        waited_ms += 20;
-    }
-    if (done < 0) { /* e.g. SIGCHLD ignored by a parent: never read that as success */
-        ERR("waitpid: %s", strerror(errno));
-        kill(-pid, SIGKILL);
-        return 0;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        ERR("helper failed (status 0x%x)", status);
-        return 0;
-    }
-    return 1;
-}
-
-/* Read a regular file of 1..CWT_CMD_MAX_CWT bytes; malloc'd result or NULL. */
-static unsigned char *read_small_file(const char *path, size_t *len)
-{
-    struct stat st;
-    unsigned char *buf = NULL;
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    ssize_t n;
-
-    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)
-            || st.st_size <= 0 || st.st_size > CWT_CMD_MAX_CWT) {
-        ERR("helper output missing, empty or larger than %d bytes", CWT_CMD_MAX_CWT);
-        goto err;
-    }
-    buf = malloc((size_t)st.st_size);
-    if (buf == NULL)
-        goto err;
-    n = read(fd, buf, (size_t)st.st_size);
-    if (n != st.st_size) {
-        free(buf);
-        buf = NULL;
-        goto err;
-    }
-    *len = (size_t)n;
- err:
-    if (fd >= 0)
-        close(fd);
-    return buf;
-}
-
 int cwt_cmd_run(const char *cmd, const unsigned char *nonce, size_t nonce_len,
                 unsigned char **cwt, size_t *cwt_len)
 {
-    char hex[2 * CWT_CMD_NONCE_MAX + 1];
-    char path[] = "/tmp/cwt-XXXXXX";
+    char tmp_path[] = "/tmp/cwt-XXXXXX";
     unsigned char *buf = NULL;
-    size_t i, len = 0;
-    int fd, ok = 0;
+    size_t len = 0;
+    int ok = 0;
 
     if (cwt == NULL || cwt_len == NULL)
         return 0;
     *cwt = NULL;
     *cwt_len = 0;
-    if (cmd == NULL || cmd[0] != '/') {
-        ERR("GENCMPCLIENT_CWT_CMD must be an absolute path");
-        return 0;
-    }
     if (nonce == NULL || nonce_len < CWT_CMD_NONCE_MIN || nonce_len > CWT_CMD_NONCE_MAX) {
-        ERR("nonce length %zu outside %d..%d", nonce_len, CWT_CMD_NONCE_MIN, CWT_CMD_NONCE_MAX);
+        ERR("nonce length %zu outside %d..%d",
+            nonce == NULL ? 0 : nonce_len, CWT_CMD_NONCE_MIN, CWT_CMD_NONCE_MAX);
         return 0;
     }
-    for (i = 0; i < nonce_len; i++)
-        (void)snprintf(hex + 2 * i, 3, "%02x", nonce[i]); /* bounded: 2 hex digits + NUL */
-
-    fd = mkostemp(path, O_CLOEXEC);
-    if (fd < 0) {
-        ERR("mkostemp: %s", strerror(errno));
+    if (!ext_attester_run(cmd, nonce, nonce_len, CWT_CMD_MAX_CWT, tmp_path,
+                          &buf, &len))
         return 0;
-    }
-    close(fd);
-
-    if (spawn_and_wait(cmd, hex, path))
-        buf = read_small_file(path, &len);
-    if (buf != NULL && cwt_cmd_check_cwt(buf, len)) {
+    if (cwt_cmd_check_cwt(buf, len)) {
         *cwt = buf;
         *cwt_len = len;
         buf = NULL;
         ok = 1;
     }
     free(buf);
-    (void)unlink(path);
     return ok;
 }
