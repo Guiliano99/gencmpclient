@@ -17,6 +17,8 @@
 
 #include <genericCMPClient.h>
 
+#include "ext_attester.h"
+
 #include <openssl/crmf.h>      /* OSSL_CRMF_PBMPARAMETER (KeyAttestPoP build) */
 #include <openssl/ssl.h>
 
@@ -149,6 +151,7 @@ bool opt_disable_confirm;
 const char *opt_certout;
 const char *opt_chainout;
 bool opt_rats;
+bool opt_rats_nxp;
 const char *opt_rats_tokenname;
 const char *opt_rats_tokencfgpath;
 const char *opt_rats_plugincfgpath;
@@ -326,6 +329,9 @@ opt_t cmp_opts[] = {
     { "rats", OPT_BOOL, {.bit = false},
       { (const char **) &opt_rats },
       "Request certificate with remote attestation"},
+    { "rats_nxp", OPT_BOOL, {.bit = false},
+      { (const char **) &opt_rats_nxp },
+      "Request certificate with NXP ELE dev-attest (GENCMPCLIENT_NXP_CMD)"},
     { "rats_tokenname", OPT_TXT, {.txt = NULL}, { &opt_rats_tokenname },
       "Token name for remote attestation"},
     { "rats_tokencfgpath", OPT_TXT, {.txt = NULL}, { &opt_rats_tokencfgpath },
@@ -724,6 +730,15 @@ static const char *get_eareat_cose_hpke_key_path(void)
 }
 #endif
 
+/* Shared non-empty env accessor for the RATS evidence paths (used by the
+ * xclaim, NXP, and COSE helpers). Unconditional: defined outside any
+ * #ifdef so every build that selects one of those paths sees it. */
+static const char *getenv_nonempty(const char *name)
+{
+    const char *val = getenv(name);
+    return (val != NULL && val[0] != '\0') ? val : NULL;
+}
+
 #ifdef USE_XCLAIM_HPKE
 /*
  * In-process xclaim-CWT + COSE-HPKE-0 evidence (src/cwt_cmd.c, src/cose_hpke0.c).
@@ -734,12 +749,6 @@ static const char *get_eareat_cose_hpke_key_path(void)
  * the same OID as its type, so the RA/CA stores the nonce under it.
  */
 # define XCLAIM_HPKE_STMT_TYPE_OID_DEFAULT "1.3.6.1.4.1.99999.21"
-
-static const char *getenv_nonempty(const char *name)
-{
-    const char *val = getenv(name);
-    return (val != NULL && val[0] != '\0') ? val : NULL;
-}
 
 static const char *get_xclaim_hpke_stmt_oid(void)
 {
@@ -759,6 +768,103 @@ static const char *get_cose_recipient_pem(void)
     return getenv_nonempty("GENCMPCLIENT_COSE_RECIPIENT_PEM");
 }
 #endif
+
+/*
+ * NXP i.MX EdgeLock Enclave (ELE) device attestation.
+ *
+ * External-attester model: an attester helper (Python, driving the ELE or a
+ * simulated ELE) receives the RATS nonce and emits the NXP-native 280-byte
+ * dev-attest statement (sab_cmd_dev_attest_rsp_w_data_v2, ECDSA P-384 over the
+ * canonical buffer). The C client wraps the opaque statement as
+ * AttestationStatement{type=<NXP OID>, stmt=OCTET STRING} and DER's the
+ * AttestationBundle — it never parses the statement, mirroring the xclaim path
+ * and the opaque-statement rule in libattest-py's GUIDELINES.md.
+ *
+ * Helper contract:  <helper> <nonce-hex> <out-file>   (exit 0 on success)
+ * Env:
+ *   GENCMPCLIENT_NXP_CMD   absolute path to the attester helper (required)
+ *   NXP_STMT_OID           statement type OID (default 1.3.6.1.4.1.99999.30,
+ *                          matching libattest.formats.nxp resolve_ele_dev_attest_oid())
+ *
+ * The spawn mechanics (fork/exec, own process group, 30 s timeout that kills
+ * the group, output-file read) are shared with the xclaim path in
+ * src/ext_attester.c — there is no content check here: the statement is
+ * opaque, and the OID-keyed verifier appraises it.
+ */
+# define NXP_DEV_ATTEST_STMT_OID_DEFAULT "1.3.6.1.4.1.99999.30"
+# define NXP_STMT_MAX_LEN 4096
+
+static const char *get_nxp_cmd(void)
+{
+    return getenv_nonempty("GENCMPCLIENT_NXP_CMD");
+}
+
+static const char *get_nxp_stmt_oid(void)
+{
+    const char *oid = getenv_nonempty("NXP_STMT_OID");
+    return oid != NULL ? oid : NXP_DEV_ATTEST_STMT_OID_DEFAULT;
+}
+
+/*
+ * Run the attester helper with the RATS nonce; returns the raw statement via
+ * ext_attester_run() (malloc'd — caller frees with free()).
+ */
+static int run_nxp_attester(const char *cmd, const unsigned char *nonce,
+                            size_t nonce_len, unsigned char **out,
+                            size_t *out_len)
+{
+    char tmp_path[] = "/tmp/nxp_attest_XXXXXX";
+
+    if (cmd == NULL)
+        return 0;
+    if (!ext_attester_run(cmd, nonce, nonce_len, NXP_STMT_MAX_LEN, tmp_path,
+                          out, out_len)) {
+        LOG_err("run_nxp_attester: helper failed (see stderr above)");
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * getNxpDevAttestExt — build the id-aa-attestation CSR extension for NXP ELE
+ * device attestation. The RATS nonce (OSSL_CMP_CTX_get0_rats_nonce) goes to
+ * the attester helper, which returns the raw NXP-native statement; the client
+ * wraps it opaque via build_attestation_ext() and never parses it.
+ */
+static X509_EXTENSIONS *build_attestation_ext(const char *stmt_oid,
+                                              const unsigned char *os_data,
+                                              size_t os_len);
+static X509_EXTENSIONS *getNxpDevAttestExt(OSSL_CMP_CTX *ctx)
+{
+    X509_EXTENSIONS *exts = NULL;
+    const ASN1_OCTET_STRING *oct_nonce = OSSL_CMP_CTX_get0_rats_nonce(ctx);
+    const char *cmd = get_nxp_cmd();
+    unsigned char *stmt = NULL;
+    size_t stmt_len = 0;
+
+    if (cmd == NULL) {
+        LOG_err("-rats_nxp needs GENCMPCLIENT_NXP_CMD (absolute path to the "
+                "attester helper)");
+        goto err;
+    }
+    if (oct_nonce == NULL || oct_nonce->length == 0) {
+        LOG_err("getNxpDevAttestExt: no RATS nonce on CTX (was -rats_nxp set "
+                "and did GenM/GenP succeed?)");
+        goto err;
+    }
+    if (!run_nxp_attester(cmd, oct_nonce->data, (size_t)oct_nonce->length,
+                          &stmt, &stmt_len)) {
+        LOG_err("Failed to build the NXP dev-attest statement");
+        goto err;
+    }
+    LOG(FL_INFO, "getNxpDevAttestExt: NXP statement: %zu bytes, type OID %s",
+        stmt_len, get_nxp_stmt_oid());
+    exts = build_attestation_ext(get_nxp_stmt_oid(), stmt, stmt_len);
+
+ err:
+    free(stmt);
+    return exts;
+}
 
 /*
  * TPM PCR-selection / quote-parameter type OIDs.
@@ -1684,11 +1790,12 @@ static X509_EXTENSIONS *getattestationExt(OSSL_CMP_CTX *ctx,
 }
 #endif /* USE_ATGLIB */
 
-#ifdef USE_XCLAIM_HPKE
 /*
  * Wrap one evidence blob into AttestationStatement{type=stmt_oid, stmt=OCTET STRING}
  * inside an AttestationBundle and return it as the id-aa-attestation extension.
- * The OCTET STRING is the CMW `cbor` alternative (see cose_hpke0_cmw_record()).
+ * Generic over the statement encoding — the xclaim path passes a CMW `cbor`
+ * record, the NXP path passes the raw NXP-native statement bytes. Unconditional:
+ * shared by every external-attester evidence path, not just xclaim.
  */
 static X509_EXTENSIONS *build_attestation_ext(const char *stmt_oid,
                                               const unsigned char *os_data,
@@ -1767,6 +1874,7 @@ static X509_EXTENSIONS *build_attestation_ext(const char *stmt_oid,
     return exts;
 }
 
+#ifdef USE_XCLAIM_HPKE
 /*
  * Evidence = COSE-HPKE-0 COSE_Encrypt0 over the xclaim-signed CWT, as a CMW CBOR
  * record. The nonce (OSSL_CMP_CTX_get0_rats_nonce) only reaches the signed claims;
@@ -1872,23 +1980,29 @@ static int add_rats_extensions(OSSL_CMP_CTX *ctx, RATS_REQ *rats_config, X509_EX
 #if defined(USE_XCLAIM_HPKE) && defined(USE_ATGLIB)
 # error "USE_XCLAIM_HPKE and USE_ATGLIB select different -rats evidence paths; build with one of them"
 #endif
+    /* Evidence path selection. Priority: -rats_nxp (external NXP ELE helper)
+     * > native TPM (-tpm_ak_handle, rats_exts already built in the block
+     * above) > the build-selected -rats path (xclaim / ATG). */
+    if (opt_rats_nxp) {
+        /* NXP ELE dev-attest: external attester helper, opaque statement. */
+        (void)rats_config;
+        rats_exts = getNxpDevAttestExt(ctx);
+    } else if (opt_tpm_ak_handle_str != NULL) {
+        /* Native TPM path — rats_exts is set above (TPM2_Quote / TPM2_Certify
+         * via tpm_py_bridge); do not overwrite it. */
+    } else {
 #ifdef USE_XCLAIM_HPKE
-    /* xclaim CWT + in-process COSE-HPKE-0 evidence. */
-    else {
+        /* xclaim CWT + in-process COSE-HPKE-0 evidence. */
         (void)rats_config;
         rats_exts = getXclaimHpkeExt(ctx);
-    }
 #elif defined(USE_ATGLIB)
-    /* ATG library path: generate EAT token via libatg. */
-    else {
+        /* ATG library path: generate EAT token via libatg. */
         rats_exts = getattestationExt(ctx, rats_config);
-    }
 #else
-    else {
         (void)ctx;
         (void)rats_config;
-    }
 #endif
+    }
 
     if (rats_exts != NULL) {
         ret = X509v3_add_extensions(exts, rats_exts) != NULL;
@@ -2496,6 +2610,7 @@ static int setup_ctx(CMP_CTX *ctx)
                                     opt_unprotected_requests ? 1 : 0)
         || !OSSL_CMP_CTX_set_option(ctx, OSSL_CMP_OPT_INIT_RATS,
                                     (opt_rats
+                                     || opt_rats_nxp
                                      || opt_tpm_ak_handle_str != NULL) ? 1 : 0)) {
         LOG_err("Failed to set option flags of CMP context");
         goto err;
@@ -2503,12 +2618,21 @@ static int setup_ctx(CMP_CTX *ctx)
     /* Single nonce exchange per the attestation-freshness draft: the genm
      * carries one NonceRequest and the genp returns one NonceResponse whose
      * nonce qualifies the TPM2_Quote platform evidence. */
-    if (opt_rats || opt_tpm_ak_handle_str != NULL) {
+    if (opt_rats || opt_rats_nxp || opt_tpm_ak_handle_str != NULL) {
         struct rats_req *rats_config = NULL;
 
         if (opt_tpm_ak_handle_str != NULL) {
             /* Native in-process TPM path — TPM2_Quote driven by -tpm_ak_handle.
              * No ATG library config needed. */
+        } else if (opt_rats_nxp) {
+            /* NXP ELE dev-attest path — the attester helper comes from the
+             * environment; fail hard rather than fall back to another path.
+             * (Must precede the xclaim/ATG env checks so -rats_nxp alone
+             * never demands those paths' configuration.) */
+            if (get_nxp_cmd() == NULL) {
+                LOG_err("-rats_nxp needs GENCMPCLIENT_NXP_CMD in this run");
+                goto err;
+            }
         }
 #ifdef USE_XCLAIM_HPKE
         else {
@@ -2546,13 +2670,23 @@ static int setup_ctx(CMP_CTX *ctx)
 #ifdef USE_XCLAIM_HPKE
         /* Typed NonceRequest: the RA/CA stores the nonce under this OID, which is
          * also the evidence statement type it later looks it up by. */
-        if (opt_tpm_ak_handle_str == NULL
+        if (opt_rats && opt_tpm_ak_handle_str == NULL
                 && !OSSL_CMP_CTX_set1_rats_reqInfo(ctx, get_xclaim_hpke_stmt_oid(),
                                                    NULL, 0)) {
             LOG_err("Failed to set the xclaim NonceRequest type in CMP context");
             goto err;
         }
 #endif
+        if (opt_rats_nxp) {
+            /* NXP ELE dev-attest: the RA/CA stores the nonce under the statement
+             * type OID (libattest.formats.nxp ELE_DEV_ATTEST_OID). No reqInfo —
+             * the ELE binds the nonce itself (nounce = nonce[:16] signed inside
+             * the statement). */
+            if (!OSSL_CMP_CTX_set1_rats_reqInfo(ctx, get_nxp_stmt_oid(), NULL, 0)) {
+                LOG_err("Failed to set the NXP NonceRequest type in CMP context");
+                goto err;
+            }
+        }
         if (opt_tpm_subject_pub_der != NULL)
             LOG_warn("-tpm_subject_pub_der is ignored (reserved; native certify "
                      "uses -tpm_subject_pem)");
